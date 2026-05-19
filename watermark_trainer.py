@@ -94,6 +94,23 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 mag_norm = (mag - mag.mean()) / (mag.std() + 1e-6)
                 m1_norm = (m1tensor - m1tensor.mean()) / (m1tensor.std() + 1e-6)
                 loss_shape = F.mse_loss(mag_norm, m1_norm)
+                #给loss_shape加mask  只关注低频区域，比如只关注半径小于20的区域
+                # ======================
+                B, C, H, W = mag.shape
+                cx = W // 2
+                cy = H // 2
+
+                # 生成坐标网格
+                y_grid, x_grid = torch.meshgrid(torch.arange(H, device=mag.device) - cy,
+                                                torch.arange(W, device=mag.device) - cx,
+                                                indexing='ij')
+                # 距离中心的平方
+                dist_sq = x_grid ** 2 + y_grid ** 2
+                # 低频mask：半径 <= 20 的区域全部为 1
+                mask = (dist_sq <= 20 ** 2).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                # 只计算低频区域的 loss
+                loss_shape = (loss_shape * mask).sum() / (mask.sum() + 1e-6)
+
 
                 # 3. 引入对比度约束 (在极坐标域)
                 #loss_contrast = contrastive_energy_loss(polar_feat, watermarks, margin=100)
@@ -281,7 +298,7 @@ def main():
     parser.add_argument('--num_bits', type=int, default=60, help='Number of bits for watermark decoding')
     parser.add_argument('--r', type=list, default=[5,9,13], help='Radius for watermark decoding')
     parser.add_argument('--bitsf', type=list, default=[5,15,40], help='Bits for each radius')
-    parser.add_argument('--alpha_embed', type=float, default=1, help='Embedding strength')
+    parser.add_argument('--alpha_embed', type=float, default=0.5, help='Embedding strength')
     args = parser.parse_args()
     
     # 设置使用的GPU
