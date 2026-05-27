@@ -9,19 +9,19 @@ from tqdm import tqdm
 import argparse
 import logging
 
-from encode import Watermark16Sector
-from watermark_decoder import AdvancedWatermarkDecoder
+from encode2 import Watermark16Sector1
+from watermark_decoder3 import AdvancedWatermarkDecoder
 from noise_utils import add_pimog_noise, add_jpeg_compression_noise
 
 
 class InferenceDataset(Dataset):
-    def __init__(self, image_dir, block_size=512, num_bits=4, r=[5, 12], transform=None, max_images=100, alpha_embed=0.005):
+    def __init__(self, image_dir, block_size=512, num_bits=4, r=[5, 12], bits=[5, 20], transform=None, max_images=100, alpha_embed=0.005):
         self.image_dir = image_dir
         self.block_size = block_size
         self.transform = transform
         self.alpha_embed = alpha_embed
         self.num_bits = num_bits
-        self.watermark_system = Watermark16Sector(L1=block_size, k1=30000, r=r, r_range=2, n_sectors=num_bits)
+        self.watermark_system = Watermark16Sector1(L1=block_size, k1=30000, r=r, bitsf=bits, r_range=1, n_sectors=num_bits)
         self.image_files = [f for f in os.listdir(image_dir)
                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
         if max_images > 0:
@@ -93,12 +93,13 @@ def main():
     parser = argparse.ArgumentParser(description='Watermark Inference')
     parser.add_argument('--input_dir', type=str, default='/mnt/ylyu/COCO-val2017/', help='Input image directory')
     parser.add_argument('--output_dir', type=str, default='inference_output_001', help='Output directory for watermarked images')
-    parser.add_argument('--model_path', type=str, default='output_001/models/best_watermark_decoder.pth', help='Path to trained decoder model')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--model_path', type=str, default='/home/ylu2024/workspace/fftmask/output_60/models/best_watermark_decoder.pth', help='Path to trained decoder model')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--block_size', type=int, default=512, help='Block size')
-    parser.add_argument('--num_bits', type=int, default=4, help='Number of watermark bits')
-    parser.add_argument('--r', type=int, nargs='+', default=[5, 11], help='Radius for watermark')
-    parser.add_argument('--alpha_embed', type=float, default=0.01, help='Embedding strength')
+    parser.add_argument('--num_bits', type=int, default=60, help='Number of watermark bits')
+    parser.add_argument('--r', type=int, nargs='+', default=[5, 10, 15], help='Radius for watermark')
+    parser.add_argument('--bitsf', type=int, nargs='+', default=[5, 20, 35], help='Bits for each radius')
+    parser.add_argument('--alpha_embed', type=float, default=0.05, help='Embedding strength')
     parser.add_argument('--max_images', type=int, default=100, help='Maximum number of images to process')
     parser.add_argument('--num_crops', type=int, default=2, help='Number of random crops for noise test')
     parser.add_argument('--device', type=str, default='3', help='GPU device')
@@ -136,6 +137,7 @@ def main():
         block_size=args.block_size,
         num_bits=args.num_bits,
         r=args.r,
+        bits=args.bitsf,
         transform=transform,
         max_images=args.max_images,
         alpha_embed=args.alpha_embed
@@ -143,11 +145,15 @@ def main():
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    model = AdvancedWatermarkDecoder(n_sectors=args.num_bits)
+    model = AdvancedWatermarkDecoder(n_sectors=args.num_bits, rings=[(r-1, r+1) for r in args.r], bits=args.bitsf)
 
     if os.path.exists(args.model_path):
         state_dict = torch.load(args.model_path, map_location=device)
-        model.load_state_dict(state_dict)
+         # 🔥 关键：自动去除多GPU训练的 module. 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k.replace("module.", "")] = v
+        model.load_state_dict(new_state_dict)
         logger.info(f"Loaded model from {args.model_path}")
     else:
         logger.warning(f"Model not found at {args.model_path}, using untrained model")
@@ -178,7 +184,7 @@ def main():
     if args.test_noise:
         logger.info(f"Testing with compression noise (JPEG quality: {args.jpeg_quality}) and screen shooting noise")
 
-    watermark_system = Watermark16Sector(L1=args.block_size, k1=30000, r=args.r, r_range=2, n_sectors=args.num_bits)
+    watermark_system = Watermark16Sector1(L1=args.block_size, k1=30000, r=args.r,bitsf=args.bitsf, r_range=2, n_sectors=args.num_bits)
     savewrite=0
     with torch.no_grad():
         for batch_idx, (original_images, watermark_bits_list, filenames) in enumerate(tqdm(dataloader, desc="Processing")):

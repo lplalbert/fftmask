@@ -44,9 +44,20 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     saveok=0
     best_val_loss = float('inf')
     # load_model='output_001/models/best_watermark_decoder4.pth'
-    load_model=None
-    if load_model:
-        model.load_state_dict(torch.load(load_model))
+    load_model="/home/ylu2024/workspace/fftmask/output_60/models/model002.pth"
+    # load_model=None
+    # if load_model:
+    #     model.load_state_dict(torch.load(load_model))
+    if os.path.exists(load_model):
+        state_dict = torch.load(load_model, map_location=device)
+         # 🔥 关键：自动去除多GPU训练的 module. 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k.replace("module.", "")] = v
+        model.load_state_dict(new_state_dict)
+        logger.info(f"Loaded model from {load_model}")
+    else:
+        logger.warning(f"Model not found at {load_model}, using untrained model")
     # 导入tqdm
     from tqdm import tqdm
     
@@ -91,8 +102,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 # loss_m1 = F.mse_loss(mag, m1tensor)
                 # B=mag.size(0)
                 # loss_m1 = (1 - F.cosine_similarity(mag.view(B,-1), m1tensor.view(B,-1)).mean())
-                mag_norm = (mag - mag.mean()) / (mag.std() + 1e-6)
-                m1_norm = (m1tensor - m1tensor.mean()) / (m1tensor.std() + 1e-6)
+                mag_norm = (mag - mag.mean()) / (mag.std() + 1e-4)
+                m1_norm = (m1tensor - m1tensor.mean()) / (m1tensor.std() + 1e-4)
                 loss_shape = F.mse_loss(mag_norm, m1_norm)
                 #给loss_shape加mask  只关注低频区域，比如只关注半径小于20的区域
                 # ======================
@@ -109,7 +120,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 # 低频mask：半径 <= 20 的区域全部为 1
                 mask = (dist_sq <= 20 ** 2).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
                 # 只计算低频区域的 loss
-                loss_shape = (loss_shape * mask).sum() / (mask.sum() + 1e-6)
+                loss_shape = (loss_shape * mask).sum() / (mask.sum() + 1e-4)
 
 
                 # 3. 引入对比度约束 (在极坐标域)
@@ -119,12 +130,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 # print(outputs[0])
                 # print(watermarks[0])
                 loss_bit = criterion(outputs, watermarks)
-                malpha=0.01
+                malpha=0.02
                 if loss_m1.item() < 1.3:
                     malpha=0.01
                 else:
-                    malpha=0.01
-                loss=8*loss_bit+malpha*loss_m1  #根据实际情况调整权重 之前是1
+                    malpha=0.02
+                loss=10*loss_bit+malpha*loss_m1  #根据实际情况调整权重 之前是1
                 accuracy = (outputs > 0.5).float() == watermarks
                 accuracy = accuracy.sum().item() / (watermarks.size(0) * watermarks.size(1))
                  # 更新进度条
@@ -133,6 +144,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 # 反向传播和优化
                 optimizer.zero_grad()
                 loss.backward()
+                # 添加梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 if writer:
                     writer.add_scalar('Loss/Train_bit', loss_bit.item(), global_step=step+epoch*len(train_loader))
@@ -290,15 +303,15 @@ def main():
     parser.add_argument('--val_dir', type=str, default="/mnt/ylyu/COCO-val2017/", help='Validation data directory')
     parser.add_argument('--test_dir', type=str, default="/mnt/ylyu/COCO-test2017/", help='Test data directory')
     parser.add_argument('--output_dir', type=str, default='/home/ylu2024/workspace/fftmask/output_60', help='Output directory for models and logs')
-    parser.add_argument('--batch_size', type=int, default=40, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=50, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-    parser.add_argument('--device', type=str, default='2,3', help='Device to use for training')
+    parser.add_argument('--device', type=str, default='0', help='Device to use for training')
     parser.add_argument('--block_size', type=int, default=512, help='Block size for watermark decoding')
     parser.add_argument('--num_bits', type=int, default=60, help='Number of bits for watermark decoding')
-    parser.add_argument('--r', type=list, default=[5,9,13], help='Radius for watermark decoding')
-    parser.add_argument('--bitsf', type=list, default=[5,15,40], help='Bits for each radius')
-    parser.add_argument('--alpha_embed', type=float, default=0.5, help='Embedding strength')
+    parser.add_argument('--r', type=list, default=[5,10,15], help='Radius for watermark decoding')
+    parser.add_argument('--bitsf', type=list, default=[5,20,35], help='Bits for each radius')
+    parser.add_argument('--alpha_embed', type=float, default=0.01, help='Embedding strength')
     args = parser.parse_args()
     
     # 设置使用的GPU
@@ -357,8 +370,8 @@ def main():
     criterion = nn.MSELoss()
     # criterion = nn.BCELoss()
     # optimizer = optim.SGD(model.parameters(), lr=args.lr)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     # 初始化SummaryWriter
     writer = SummaryWriter(os.path.join(args.output_dir, 'runs', timestamp))
