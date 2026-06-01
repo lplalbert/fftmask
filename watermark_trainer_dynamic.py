@@ -15,9 +15,9 @@ from dataset import WatermarkDataset
 from watermark_decoder3 import AdvancedWatermarkDecoder
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20, output_dir='output', logger=None, writer=None):
+def train_model(model, train_dataset, val_dataset, criterion, optimizer, num_epochs=20, output_dir='output', logger=None, writer=None, args=None):
     """
-    训练模型
+    训练模型 - 支持动态调整水印强度和噪声强度
     """
     # 检查GPU数量
     num_gpus = torch.cuda.device_count()
@@ -44,7 +44,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     saveok=0
     best_val_loss = float('inf')
     # load_model='output_001/models/best_watermark_decoder4.pth'
-    # load_model="/home/ylu2024/workspace/fftmask/output_60/models/model010.pth"
+    # load_model="/home/ylu2024/workspace/fftmask/output_60_dynamic/models/model010.pth"
     load_model=None
 
     # load_model=None
@@ -52,11 +52,29 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     #     model.load_state_dict(torch.load(load_model))
     if load_model:
         if os.path.exists(load_model):
-            state_dict = torch.load(load_model, map_location=device)
-            # 🔥 关键：自动去除多GPU训练的 module. 前缀
+            # 添加 weights_only=True 解决安全警告
+            state_dict = torch.load(load_model, map_location=device, weights_only=True)
+            
+            # 处理 DataParallel 键名问题
+            # 检查当前模型是否是 DataParallel
+            is_data_parallel = isinstance(model, torch.nn.DataParallel)
+            
+            # 检查 state_dict 中的键是否有 module. 前缀
+            has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+            
             new_state_dict = {}
-            for k, v in state_dict.items():
-                new_state_dict[k.replace("module.", "")] = v
+            if is_data_parallel and not has_module_prefix:
+                # 当前模型是 DataParallel，但 state_dict 没有 module. 前缀
+                for k, v in state_dict.items():
+                    new_state_dict[f"module.{k}"] = v
+            elif not is_data_parallel and has_module_prefix:
+                # 当前模型不是 DataParallel，但 state_dict 有 module. 前缀
+                for k, v in state_dict.items():
+                    new_state_dict[k.replace("module.", "")] = v
+            else:
+                # 两者一致，直接使用
+                new_state_dict = state_dict
+            
             model.load_state_dict(new_state_dict)
             logger.info(f"Loaded model from {load_model}")
         else:
@@ -69,6 +87,56 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             break
         import time
         start_time = time.time()
+        
+        # 动态调整水印强度和噪声强度 - 阶梯式下降 + 准确率驱动
+        # 预定义配置阶梯
+        config_stages = [
+            {'alpha': 0.50, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.40, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.30, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.20, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.10, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.08, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.06, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.04, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.02, 'noise_levels': ['none', 'low', 'mid', 'high']},
+            {'alpha': 0.01, 'noise_levels': ['none', 'low', 'mid', 'high']}
+        ]
+        
+        # 初始化阶段和噪声索引
+        if not hasattr(model, 'current_stage'):
+            model.current_stage = 0
+            model.current_noise_idx = 0
+            model.best_accuracy = 0.0
+        
+        # 获取当前配置
+        current_config = config_stages[model.current_stage]
+        alpha_embed = current_config['alpha']
+        noise_level = current_config['noise_levels'][model.current_noise_idx]
+        
+        # 检查是否需要切换噪声配置
+        if epoch > 0 and model.best_accuracy > 0.95:
+            model.current_noise_idx += 1
+            if model.current_noise_idx >= len(current_config['noise_levels']):
+                model.current_noise_idx = 0
+                model.current_stage += 1
+                if model.current_stage >= len(config_stages):
+                    model.current_stage = len(config_stages) - 1  # 保持最后一个阶段
+            model.best_accuracy = 0.0  # 重置准确率阈值
+            logger.info(f'Switched to stage {model.current_stage}, noise level {noise_level}')
+        
+        # 更新数据集的参数
+        train_dataset.alpha_embed = alpha_embed
+        train_dataset.noise_level = noise_level
+        val_dataset.alpha_embed = alpha_embed  # 验证集也使用相同的水印强度
+        val_dataset.noise_level = 'none'  # 验证集不添加噪声，保持一致
+        
+        logger.info(f'Epoch {epoch+1}/{num_epochs}: alpha_embed={alpha_embed:.4f}, noise_level={noise_level}')
+        
+        # 创建新的 DataLoader（因为数据集参数变化了）
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=12,pin_memory=True,persistent_workers=True,prefetch_factor=2,)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12,pin_memory=True,persistent_workers=True,prefetch_factor=2,)
+        
         # 训练阶段
         model.train()
         train_loss = 0.0
@@ -191,11 +259,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                     writer.add_scalar('Loss/Train_m1', loss_m1.item(), global_step=step+epoch*len(train_loader))
                     writer.add_scalar('Loss/Train_total', loss.item(), global_step=step+epoch*len(train_loader))
                     writer.add_scalar('Accuracy/Train', accuracy, global_step=step+epoch*len(train_loader))
+                    writer.add_scalar('Params/alpha_embed', alpha_embed, global_step=epoch)
+                    writer.add_scalar('Params/noise_level', model.current_noise_idx, global_step=epoch)
+                    writer.add_scalar('Params/current_stage', model.current_stage, global_step=epoch)
+                
+                # 更新最佳准确率
+                if accuracy > model.best_accuracy:
+                    model.best_accuracy = accuracy
                 
                 # train_loss += loss.item() * images.size(0)
                 train_loss += loss.item()
                 
-               
         
         train_loss = train_loss / (len(train_loader.dataset)/images.size(0))
         
@@ -338,20 +412,23 @@ def main():
     import os
     
     # 参数解析
-    parser = argparse.ArgumentParser(description='Watermark Trainer')
+    parser = argparse.ArgumentParser(description='Watermark Trainer with Dynamic Parameters')
     parser.add_argument('--train_dir', type=str, default="/mnt/ylyu/COCO-train2017/", help='Training data directory')
     parser.add_argument('--val_dir', type=str, default="/mnt/ylyu/COCO-val2017/", help='Validation data directory')
     parser.add_argument('--test_dir', type=str, default="/mnt/ylyu/COCO-test2017/", help='Test data directory')
-    parser.add_argument('--output_dir', type=str, default='/home/ylu2024/workspace/fftmask/output_60', help='Output directory for models and logs')
-    parser.add_argument('--batch_size', type=int, default=40, help='Batch size')
+    parser.add_argument('--output_dir', type=str, default='/home/ylu2024/workspace/fftmask/output_60_dynamic', help='Output directory for models and logs')
+    parser.add_argument('--batch_size', type=int, default=80, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-    parser.add_argument('--device', type=str, default='0', help='Device to use for training')
+    parser.add_argument('--device', type=str, default='0,1', help='Device to use for training')
     parser.add_argument('--block_size', type=int, default=512, help='Block size for watermark decoding')
     parser.add_argument('--num_bits', type=int, default=60, help='Number of bits for watermark decoding')
     parser.add_argument('--r', type=list, default=[5,10,15], help='Radius for watermark decoding')
     parser.add_argument('--bitsf', type=list, default=[5,20,35], help='Bits for each radius')
-    parser.add_argument('--alpha_embed', type=float, default=0.05, help='Embedding strength')
+    parser.add_argument('--alpha_embed', type=float, default=0.1, help='Initial embedding strength')
+    parser.add_argument('--final_alpha', type=float, default=0.01, help='Final embedding strength')
+    parser.add_argument('--initial_noise', type=str, default='none', help='Initial noise level')
+    parser.add_argument('--final_noise', type=str, default='high', help='Final noise level')
     args = parser.parse_args()
     
     # 设置使用的GPU
@@ -377,7 +454,7 @@ def main():
     )
     
     logger = logging.getLogger()
-    logger.info('Starting watermark training')
+    logger.info('Starting watermark training with dynamic parameters')
     logger.info(f'Configuration: {args}')
     logger.info(f'Using GPUs: {args.device}')
     
@@ -389,18 +466,13 @@ def main():
     ])
     
     # 创建数据集
-    train_dataset = WatermarkDataset(args.train_dir, block_size=args.block_size, num_bits=args.num_bits, r=args.r, bits=args.bitsf, alpha_embed=args.alpha_embed, transform=transform)
-    val_dataset = WatermarkDataset(args.val_dir, block_size=args.block_size, num_bits=args.num_bits, r=args.r, bits=args.bitsf, alpha_embed=args.alpha_embed, transform=transform)
+    train_dataset = WatermarkDataset(args.train_dir, block_size=args.block_size, num_bits=args.num_bits, r=args.r, bits=args.bitsf, alpha_embed=args.alpha_embed, transform=transform, noise_level='none')
+    val_dataset = WatermarkDataset(args.val_dir, block_size=args.block_size, num_bits=args.num_bits, r=args.r, bits=args.bitsf, alpha_embed=args.alpha_embed, transform=transform, noise_level='none')
     # test_dataset = WatermarkDataset(args.test_dir, transform=transform)
     
     logger.info(f'Training dataset size: {len(train_dataset)}')
     logger.info(f'Validation dataset size: {len(val_dataset)}')
     # logger.info(f'Test dataset size: {len(test_dataset)}')
-    
-    # 数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=12,pin_memory=True,persistent_workers=True,prefetch_factor=2,)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12,pin_memory=True,persistent_workers=True,prefetch_factor=2,)
-    # test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
     # 初始化模型
     # model = WatermarkDecoder(block_size=args.block_size, num_bits=args.num_bits, r=args.r)
@@ -417,7 +489,7 @@ def main():
     writer = SummaryWriter(os.path.join(args.output_dir, 'runs', timestamp))
     
     # 训练模型
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=args.epochs, output_dir=args.output_dir, logger=logger, writer=writer)
+    train_model(model, train_dataset, val_dataset, criterion, optimizer, num_epochs=args.epochs, output_dir=args.output_dir, logger=logger, writer=writer, args=args)
     
     # 关闭SummaryWriter
     writer.close()

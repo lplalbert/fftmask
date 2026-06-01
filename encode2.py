@@ -178,17 +178,20 @@ class Watermark16Sector1:
         spatial = np.real(ifft2(ifftshift(M1)))
         Tm = np.where(spatial < 0, 0, 255).astype(np.uint8)
         return Tm, M1
-
+import os
 if __name__ == "__main__":
     import time
     t0 = time.time()
 
     # 初始化参数和你完全一样
-    wm = Watermark16Sector1(L1=512, k1=30000, r=[5,9, 12], bitsf=[5,15,40], r_range=0, n_sectors=60)
-    Tm, M1 = wm.generate_template(numbit=None)
-
-    cv2.imwrite(f"img_mask/watermark_template.png", Tm)
-    cv2.imwrite(f"img_mask/watermark_spectrum.png",
+    wm = Watermark16Sector1(L1=512, k1=30000, r=[5,10, 15], bitsf=[5,20,35], r_range=1, n_sectors=60)
+    
+    if(os.path.exists("img_encode") == False):
+        os.makedirs("img_encode")
+    for i in range(6):
+        Tm, M1 = wm.generate_template(numbit=None)
+        cv2.imwrite(f"img_encode/watermark_template_{i}.png", Tm)
+        cv2.imwrite(f"img_encode/watermark_spectrum_{i}.png",
                 cv2.normalize(M1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
 
     print(f"耗时：{time.time() - t0:.3f}s")

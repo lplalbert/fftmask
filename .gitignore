@@ -6,6 +6,9 @@ inference_output_001
 output
 output_001
 output_60
+output_60_dynamic
+output_merge
 output_noise
+img_encode
 tmp
 __pycache__
