@@ -1,0 +1,39 @@
+# ── 微调配置 ──────────────────────────────────────────
+# 从 best_cb_decoder.pth 继续微调
+version: "finetune_v1"
+description: "Cb通道解码器微调"
+
+# ── 数据集 ──────────────────────────────────────────
+train_data_paths:
+  - "/mnt/xsj2023/Datasets/document_ds/document_train"
+  - "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+train_data_lengths:
+  - 5000
+  - 5000
+val_dir: "/mnt/xsj2023/Datasets/document_ds/document_val"
+
+# ── 模型 ──────────────────────────────────────────
+resume: "/mnt/lpl/fftmask/output/v1_valnoise/20260629_005346/models/best_cb_decoder.pth"
+output_dir: "/mnt/lpl/fftmask/output/finetune"
+block_size: 512
+num_bits: 60
+r: [12, 25]
+bitsf: [15, 45]
+ring_width: 5
+
+# ── 训练参数 ──────────────────────────────────────
+batch_size: 64
+epochs: 50
+lr: 0.00005
+device: "0,1"
+
+# ── 噪声策略 ──────────────────────────────────────
+noise_schedule:
+  - [999, 0.016, "pair"]
+
+# ── 模式 ──────────────────────────────────────────
+mode: "decoder_only"
+
+# ── 损失权重 ──────────────────────────────────────
+lambda_bit: 15.0
+lambda_shape: 0.04
