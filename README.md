@@ -1,36 +1,67 @@
-## encode2.py :
-新的嵌入三圈的方法
-## watermark_decoder3.py：
-vit解码
-## watermark_trainer.py
-数据集目录：
+# FFT频域水印系统
 
+基于FFT频域的图像水印嵌入与解码系统，在YCrCb色彩空间的Cb通道中嵌入60bit水印信号。
 
- parser.add_argument('--train_dir', type=str, default="/mnt/ylyu/COCO-train2017/", help='Training data directory')
-parser.add_argument('--val_dir', type=str, default="/mnt/ylyu/COCO-val2017/", help='Validation data directory')
-parser.add_argument('--test_dir', type=str, default="/mnt/ylyu/COCO-test2017/", help='Test data directory')
-parser.add_argument('--output_dir', type=str, default='/home/ylu2024/workspace/fftmask/output_60', help='Output directory for models and logs')
+## 快速开始
 
+### 训练
 
-训练设置：
+```bash
+python train_cb.py --config config/train_cb_v1_valnoise.yaml
+```
 
+### 水印嵌入
 
-parser.add_argument('--batch_size', type=int, default=40, help='Batch size')
-parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-parser.add_argument('--block_size', type=int, default=512, help='Block size for watermark decoding')
+```python
+from encode2 import Watermark16Sector1
 
+wm = Watermark16Sector1(seed=2026, r=[12, 25], bits=[15, 45], k1=30000)
+template = wm.make_template()
+# 嵌入到Cb通道
+```
 
-gpu设备：
+### 单图解码
 
+```bash
+python decode_channel_watermark.py \
+  --input image.png \
+  --model_path best_cb_decoder.pth \
+  --bits_file bits.txt \
+  --channel cb
+```
 
-parser.add_argument('--device', type=str, default='2,3', help='Device to use for training')
+### 批量搜索解码
 
+```bash
+python sweep_decode_channel_watermark.py \
+  --input_dir images/ \
+  --model_path best_cb_decoder.pth \
+  --bits_file bits.txt \
+  --channels cb \
+  --min_edges 1024
+```
 
-水印嵌入相关设置:
+## 核心参数
 
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| num_bits | 60 | 水印总bit数 |
+| r | [12, 25] | 频域环半径 |
+| bitsf | [15, 45] | 每环bit数 |
+| ring_width | 5 | 环半宽度 |
+| k1 | 30000 | 模板缩放系数 |
+| alpha_embed | 0.016 | 嵌入强度 |
 
-parser.add_argument('--num_bits', type=int, default=60, help='Number of bits for watermark decoding')
-parser.add_argument('--r', type=list, default=[5,9,13], help='Radius for watermark decoding')
-parser.add_argument('--bitsf', type=list, default=[5,15,40], help='Bits for each radius')
-parser.add_argument('--alpha_embed', type=float, default=1, help='Embedding strength')
+## 文件结构
+
+- `watermark_decoder3.py` - 解码器模型（AdvancedWatermarkDecoder）
+- `encode2.py` - 水印模板生成（Watermark16Sector1）
+- `dataset.py` - 训练数据集
+- `noise_utils.py` - 噪声增强
+- `train_cb.py` - 训练脚本
+- `decode_channel_watermark.py` - 单图解码
+- `sweep_decode_channel_watermark.py` - 多尺寸搜索解码
+- `config/` - 训练配置
+- `best_cb_decoder.pth` - 预训练模型
+
+详细说明见 [WORKFLOW.md](WORKFLOW.md)

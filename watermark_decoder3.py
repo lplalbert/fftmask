@@ -6,7 +6,7 @@ import torchvision.utils as vutils
 import os
 
 # ==========================
-# 【你要的修改】极坐标函数增加 min_radius
+# 极坐标函数增加 min_radius
 # 支持：[min_radius, max_radius] 范围采样
 # ==========================
 def cartesian_to_polar(input_tensor, output_shape, min_radius, max_radius):
@@ -18,26 +18,26 @@ def cartesian_to_polar(input_tensor, output_shape, min_radius, max_radius):
     """
     B, C, H, W = input_tensor.shape
     R_bins, T_bins = output_shape
-    
+
     # 数值稳定性检查
     if torch.isnan(input_tensor).any() or torch.isinf(input_tensor).any():
         print(f"[WARNING] NaN/Inf found in cartesian_to_polar input!")
         print(f"  NaN count: {torch.isnan(input_tensor).sum()}")
         print(f"  Inf count: {torch.isinf(input_tensor).sum()}")
     input_tensor = torch.nan_to_num(input_tensor, nan=0.0, posinf=1e6, neginf=-1e6)
-    
+
     # 核心修改：从 min ~ max 采样，不再从 0 开始
     rho = torch.linspace(min_radius, max_radius, R_bins, device=input_tensor.device)
     theta = torch.linspace(0, np.pi, T_bins, device=input_tensor.device)
-    
+
     grid_rho, grid_theta = torch.meshgrid(rho, theta, indexing='ij')
-    
+
     grid_x = grid_rho * torch.cos(grid_theta) / (W / 2)
     grid_y = grid_rho * torch.sin(grid_theta) / (H / 2)
-    
+
     grid = torch.stack([grid_y, grid_x], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
     polar_map = F.grid_sample(input_tensor, grid, mode='bilinear', align_corners=True)
-    
+
     # 再次检查输出
     if torch.isnan(polar_map).any() or torch.isinf(polar_map).any():
         print(f"[WARNING] NaN/Inf found in cartesian_to_polar output!")
@@ -47,7 +47,7 @@ def cartesian_to_polar(input_tensor, output_shape, min_radius, max_radius):
     return polar_map
 
 # ==========================
-# 【完全不动】ResUNet 系列
+# ResUNet 系列
 # ==========================
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -58,7 +58,7 @@ class ResidualBlock(nn.Module):
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        
+
         # 添加缩放层，代替 Norm 层的功能
         self.scale1 = nn.Parameter(torch.ones(out_channels))
         self.bias1 = nn.Parameter(torch.zeros(out_channels))
@@ -72,21 +72,21 @@ class ResidualBlock(nn.Module):
             print(f"  Inf count: {torch.isinf(x).sum()}")
         x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         identity = self.shortcut(x)
-        
+
         # 简化版：Conv + 缩放 + ReLU
         out = self.conv1(x)
         # 应用缩放和偏移
         out = out * self.scale1.view(1, -1, 1, 1) + self.bias1.view(1, -1, 1, 1)
         out = self.relu(out)
-        
+
         out = self.conv2(out)
         # 应用缩放和偏移
         out = out * self.scale2.view(1, -1, 1, 1) + self.bias2.view(1, -1, 1, 1)
-        
+
         # 残差连接
         out += identity
         out = self.relu(out)
-        
+
         out = torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
         return out
 
@@ -144,7 +144,7 @@ class PatchEmbedding(nn.Module):
         self.proj = nn.Linear(in_dim, embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-    
+
     def forward(self, x):
         # 数值稳定性检查
         if torch.isnan(x).any() or torch.isinf(x).any():
@@ -152,13 +152,13 @@ class PatchEmbedding(nn.Module):
             print(f"  NaN count: {torch.isnan(x).sum()}")
             print(f"  Inf count: {torch.isinf(x).sum()}")
         x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-        
+
         B = x.shape[0]
         x = self.proj(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
-        
+
         # 再次检查
         if torch.isnan(x).any() or torch.isinf(x).any():
             print(f"[WARNING] NaN/Inf found in PatchEmbedding after projection!")
@@ -177,7 +177,7 @@ class AdvancedWatermarkDecoder(nn.Module):
         self.rings = rings if rings is not None else [(4, 6), (8, 10), (11, 13)]
         self.bits = bits if bits is not None else [5, 15, 40]
         self.angle_bins = 180
-        self.radius_bins = 8
+        self.radius_bins = 12
 
         # ViT 配置
         self.embed_dim = 256
@@ -223,11 +223,11 @@ class AdvancedWatermarkDecoder(nn.Module):
             print(f"  NaN count: {torch.isnan(x).sum()}")
             print(f"  Inf count: {torch.isinf(x).sum()}")
         x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-        
+
         res = self.pre_filter(x)
         fft_map = torch.fft.fftshift(torch.fft.fft2(res, dim=(-2,-1)), dim=(-2,-1))
         mag = torch.abs(fft_map)
-        
+
         # mag 数值稳定性检查
         if torch.isnan(mag).any() or torch.isinf(mag).any():
             print(f"[WARNING] NaN/Inf found in mag after FFT!")
@@ -243,10 +243,10 @@ class AdvancedWatermarkDecoder(nn.Module):
                 min_radius=min_r,
                 max_radius=max_r
             )
-            
+
             # [B, 1, R, T] -> [B, T, R]
             polar_reshaped = polar.squeeze(1).permute(0, 2, 1)  # [B, 180, 8]
-            
+
             # 根据 bit 数量分块：保留完整角度范围，不 mean 压缩
             angles_per_bit = self.angle_bins // bit_num
             patches = []
@@ -256,14 +256,14 @@ class AdvancedWatermarkDecoder(nn.Module):
                 bit_patch = polar_reshaped[:, start:end, :].flatten(1)  # [B, angles_per_bit*R]
                 patches.append(bit_patch)
             patches = torch.stack(patches, dim=1)  # [B, bit_num, angles_per_bit*R]
-            
-            # Patch Embedding 
+
+            # Patch Embedding
             x = patch_embed(patches)  # [B, bit_num+1, embed_dim]
-            
+
             # Transformer 编码
             x = transformer(x)  # [B, bit_num+1, embed_dim]
-            
-            # 使用 <[BOS_never_used_51bce0c785ca2f68081bfa7d91973934]> token 作为该 ring 的表示
+
+            # 使用 CLS token 作为该 ring 的表示
             ring_repr = x[:, 0, :]  # [B, embed_dim]
             ring_embeds.append(ring_repr)
 
@@ -276,7 +276,7 @@ class AdvancedWatermarkDecoder(nn.Module):
         fused = torch.nan_to_num(fused, nan=0.0, posinf=1e6, neginf=-1e6)
         fused = self.cross_ring_fusion(fused)  # [B, embed_dim]
         logits = self.head(fused)
-        
+
         # 输出检查
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             print(f"[WARNING] NaN/Inf found in logits!")

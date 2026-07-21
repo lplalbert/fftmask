@@ -5,19 +5,22 @@ import torch
 import random
 from torch.utils.data import Dataset
 from encode2 import Watermark16Sector1
-from noise_utils import add_pimog_noise, add_jpeg_compression_noise
+from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_tile_rotate_crop_noise
 class WatermarkDataset(Dataset):
     """
     水印数据集
     生成带水印的图像和对应的水印标签
     """
-    def __init__(self, image_dir, block_size=512, num_bits=4, r=[3,6], bits=[5,15], alpha_embed=0.01, transform=None, noise_level='none'):
+    def __init__(self, image_dir, block_size=512, num_bits=4, r=[3,6], bits=[5,15], alpha_embed=0.01, transform=None, noise_level='none', noise_pool=None, max_angle=180, crop_scale_range=None):
         self.image_dir = image_dir
         self.block_size = block_size
         self.transform = transform
         self.alpha_embed = alpha_embed
         self.num_bits = num_bits
         self.noise_level = noise_level.lower()
+        self.noise_pool = noise_pool
+        self.max_angle = max_angle
+        self.crop_scale_range = crop_scale_range
         self.watermark_system = Watermark16Sector1(L1=block_size, k1=30000, r=r, bitsf=bits, r_range=1,n_sectors=num_bits) #2gaiwei1
         self.image_files = [f for f in os.listdir(image_dir) 
                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
@@ -43,12 +46,18 @@ class WatermarkDataset(Dataset):
                 'pimog_level': 0.15,
                 'jpeg_quality': 20,
                 'tile_crop_ratio': 0.1  # 裁剪比例范围: 0.0-2.0
+            },
+            'tile_rotate': {
+                'pimog_level': 0.0,
+                'jpeg_quality': 100,
+                'tile_crop_ratio': 0.0
             }
         }
         
-        # 验证噪声强度参数
-        if self.noise_level not in self.noise_config:
-            raise ValueError(f"noise_level must be one of: {list(self.noise_config.keys())}")
+        # 验证噪声强度参数 (pair 模式在 __getitem__ 中特殊处理)
+        valid_levels = list(self.noise_config.keys()) + ['pair']
+        if self.noise_level not in valid_levels:
+            raise ValueError(f"noise_level must be one of: {valid_levels}")
     
     def __len__(self):
         return len(self.image_files)
@@ -80,13 +89,28 @@ class WatermarkDataset(Dataset):
         else:
             raise ValueError(f'Unexpected m1 shape: {m1.shape}')
 
-        markimg=host_bgr.astype(np.float32)*(1-self.alpha_embed)+Tm.astype(np.float32)*self.alpha_embed   
-        # 添加数值稳定性检查
-        if np.isnan(markimg).any() or np.isinf(markimg).any():
-            print(f"NaN or Inf found in markimg! alpha_embed={self.alpha_embed}")
-            watermarked_image = host_bgr.copy()
+        # Cb通道嵌入：转换到YCrCb，在Cb通道加水印
+        ycrcb = cv2.cvtColor(host_bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+        y_ch, cr_ch, cb_ch = cv2.split(ycrcb)
+
+        # 将Tm转为单通道用于Cb嵌入
+        if len(Tm.shape) == 3:
+            Tm_gray = cv2.cvtColor(Tm, cv2.COLOR_BGR2GRAY).astype(np.float32)
         else:
-            watermarked_image=np.clip(markimg, 0, 255).astype(np.uint8)
+            Tm_gray = Tm.astype(np.float32)
+
+        # 在Cb通道嵌入水印
+        cb_wm = cb_ch * (1 - self.alpha_embed) + Tm_gray * self.alpha_embed
+
+        # 添加数值稳定性检查
+        if np.isnan(cb_wm).any() or np.isinf(cb_wm).any():
+            print(f"NaN or Inf found in cb_wm! alpha_embed={self.alpha_embed}")
+            cb_wm = cb_ch.copy()
+
+        cb_wm = np.clip(cb_wm, 0, 255).astype(np.uint8)
+        ycrcb_wm = cv2.merge([y_ch.astype(np.uint8), cr_ch.astype(np.uint8), cb_wm])
+        watermarked_image = cv2.cvtColor(ycrcb_wm, cv2.COLOR_YCrCb2BGR)
+        watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
         # host_yuv = cv2.cvtColor(host_bgr, cv2.COLOR_BGR2YUV)
         # host_y = host_yuv[:, :, 0].astype(np.float32)
         
@@ -103,57 +127,68 @@ class WatermarkDataset(Dataset):
         # watermarked_image = cv2.cvtColor(watermarked_yuv, cv2.COLOR_YUV2BGR)
         # watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
         
-        # 添加噪声（在转换为灰度前）
-        if self.noise_level != 'none':
+        # 添加噪声（在转换为Cb通道前）
+        if self.noise_level == 'tile_rotate':
+            # tile_rotate噪声：3x3平铺 + 旋转 + 裁剪
+            from noise_utils import add_tile_rotate_crop_noise
+            watermarked_image = add_tile_rotate_crop_noise(
+                watermarked_image,
+                angle_range=(-self.max_angle, self.max_angle),
+                crop_scale_range=self.crop_scale_range
+            )
+        elif self.noise_level == 'pair':
+            # 两两配对噪声：从低/中/高噪声中随机选两种依次应用
+            pair_configs = ['low', 'mid', 'high']
+            selected = np.random.choice(pair_configs, size=2, replace=True)
+            for sel in selected:
+                config = self.noise_config[sel]
+                noise_types = ['pimog', 'jpeg', 'tile_crop']
+                noise_type = np.random.choice(noise_types)
+
+                if noise_type == 'pimog' and config['pimog_level'] > 0:
+                    watermarked_image = add_pimog_noise(watermarked_image, noise_level=config['pimog_level'])
+                elif noise_type == 'jpeg' and config['jpeg_quality'] < 100:
+                    watermarked_image = add_jpeg_compression_noise(watermarked_image, quality=config['jpeg_quality'])
+                elif noise_type == 'tile_crop' and config['tile_crop_ratio'] > 0:
+                    # 循环平移：对水印模板进行随机平移
+                    shift_x = random.randint(0, self.block_size - 1)
+                    shift_y = random.randint(0, self.block_size - 1)
+                    # 循环平移Tm
+                    Tm_shifted = np.roll(np.roll(Tm, shift_x, axis=1), shift_y, axis=0)
+                    # 重新嵌入
+                    watermarked_image = host_bgr.astype(np.float32) * (1 - self.alpha_embed) + Tm_shifted.astype(np.float32) * self.alpha_embed
+                    watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
+        elif self.noise_level != 'none':
             config = self.noise_config[self.noise_level]
-            
+
             # 随机选择噪声类型
             noise_types = ['none', 'pimog', 'jpeg', 'tile_crop']
             noise_type = np.random.choice(noise_types)
-            
+
             if noise_type == 'pimog' and config['pimog_level'] > 0:
                 watermarked_image = add_pimog_noise(watermarked_image, noise_level=config['pimog_level'])
             elif noise_type == 'jpeg' and config['jpeg_quality'] < 100:
-                
+
                 watermarked_image = add_jpeg_compression_noise(watermarked_image, quality=config['jpeg_quality'])
-               
+
             elif noise_type == 'tile_crop' and config['tile_crop_ratio'] > 0:
-                # 平铺随机裁剪噪声 - 固定平铺 2x2，创建 1024x1024 的图像
-                target_size = self.block_size * 2  # 固定 1024x1024
-                
-                # 放大原图到 1024x1024
-                host_1024 = cv2.resize(host_bgr, (target_size, target_size))
-                
-                # 平铺水印到 1024x1024
-                tiled = np.tile(Tm, (2, 2, 1)) if len(Tm.shape) == 3 else np.tile(Tm, (2, 2))
-                tiled = cv2.resize(tiled, (target_size, target_size))
-                
-                # 创建带水印的 1024x1024 图像
-                watermarked_1024 = host_1024.astype(np.float32) * (1 - self.alpha_embed) + tiled.astype(np.float32) * self.alpha_embed
-                watermarked_1024 = np.clip(watermarked_1024, 0, 255).astype(np.uint8)
-                
-                # 根据裁剪比例计算裁剪大小
-                ratio = config['tile_crop_ratio']
-                crop_ratio = np.random.uniform(max(0, 1 - ratio), 1 + ratio)
-                crop_size = int(self.block_size * crop_ratio)
-                crop_size = max(1, min(crop_size, self.block_size))  # 确保裁剪大小有效
-                
-                # 随机裁剪 1024x1024 图像
-                max_offset = target_size - crop_size
-                x = random.randint(0, max_offset)
-                y = random.randint(0, max_offset)
-                watermarked_image = watermarked_1024[y:y+crop_size, x:x+crop_size,:]
-                
-                # resize 回 512x512
-                watermarked_image = cv2.resize(watermarked_image, (self.block_size, self.block_size))
+                # 循环平移：对水印模板进行随机平移
+                shift_x = random.randint(0, self.block_size - 1)
+                shift_y = random.randint(0, self.block_size - 1)
+                # 循环平移Tm
+                Tm_shifted = np.roll(np.roll(Tm, shift_x, axis=1), shift_y, axis=0)
+                # 重新嵌入
+                watermarked_image = host_bgr.astype(np.float32) * (1 - self.alpha_embed) + Tm_shifted.astype(np.float32) * self.alpha_embed
+                watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
             else:
                 watermarked_image = host_bgr.copy()
         
-        # Convert to grayscale
+        # 提取Cb通道作为单通道输入
         watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
-        watermarked_image = cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2GRAY)
+        ycrcb_out = cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2YCrCb)
+        cb_out = ycrcb_out[:, :, 2]  # Cb通道
         # Add channel dimension
-        watermarked_image = watermarked_image[..., np.newaxis]
+        watermarked_image = cb_out[..., np.newaxis]
 
         if len(m1.shape) == 2:
             m1 = m1[..., np.newaxis]

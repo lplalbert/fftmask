@@ -402,6 +402,8 @@ def add_noise_to_batch(images, noise_type='pimog', noise_level=0.1):
             # 对于JPEG，使用噪声强度作为质量参数
             quality = max(1, int(100 - noise_level * 99))
             noisy_img = add_jpeg_compression_noise(img, quality)
+        elif noise_type == 'tile_rotate_crop':
+            noisy_img = add_tile_rotate_crop_noise(img)
         else:
             noisy_img = img
         
@@ -427,7 +429,95 @@ def apply_noise_during_training(images, noise_prob=0.5, noise_level=0.1):
     """
     if np.random.random() < noise_prob:
         # 随机选择噪声类型
-        noise_type = np.random.choice(['pimog', 'jpeg'])
+        noise_type = np.random.choice(['pimog', 'jpeg', 'tile_rotate_crop'])
         images = add_noise_to_batch(images, noise_type, noise_level)
     
     return images
+
+
+def add_wechat_noise(image, quality=60, zigzag_keep=21, **kwargs):
+    """
+    模拟微信JPEG压缩噪声（stub，降级为普通JPEG）
+    """
+    return add_jpeg_compression_noise(image, quality=quality)
+
+
+def add_perspective_noise(image, d_range=(0, 0.2)):
+    """
+    模拟透视变换噪声（stub，降级为轻微仿射变换）
+    """
+    h, w = image.shape[:2]
+    d_ratio = np.random.uniform(d_range[0], d_range[1])
+    d_px = d_ratio * min(h, w)
+
+    src_pts = np.float32([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]])
+    dst_pts = src_pts + np.random.uniform(-d_px, d_px, src_pts.shape).astype(np.float32)
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    return cv2.warpPerspective(image, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+
+
+def add_tile_rotate_crop_noise(image, angle_range=(-180, 180), crop_scale_range=None):
+    """
+    模拟循环平移+旋转噪声：将图像拼成3x3大图，随机旋转后从中间裁剪。
+
+    原理：
+    - 3x3拼接使中心区域四周都有内容，旋转后裁剪不会出现黑边
+    - 等效于先随机平移（循环移位）再随机旋转，增强模型对水印位置和角度的鲁棒性
+
+    Args:
+        image: 输入图像 (H, W, C) 或 (H, W)，numpy数组
+        angle_range: 旋转角度范围（度），默认 (-180, 180)
+        crop_scale_range: 裁剪尺寸浮动范围，默认 None (不浮动)
+                         例如 (0.9, 1.1) 表示裁剪边长为原尺寸的 0.9~1.1 倍
+
+    Returns:
+        裁剪后的图像，尺寸与输入相同
+    """
+    h, w = image.shape[:2]
+    is_gray = len(image.shape) == 2
+
+    # 1. 拼成3x3大图
+    if is_gray:
+        tiled = np.tile(image, (3, 3))
+    else:
+        tiled = np.tile(image, (3, 3, 1))
+
+    # 2. 随机旋转
+    angle = np.random.uniform(angle_range[0], angle_range[1])
+    center = (tiled.shape[1] / 2, tiled.shape[0] / 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(tiled, M, (tiled.shape[1], tiled.shape[0]),
+                             borderMode=cv2.BORDER_WRAP)
+
+    # 3. 计算裁剪尺寸
+    if crop_scale_range is not None:
+        # 浮动尺寸裁剪
+        scale = np.random.uniform(crop_scale_range[0], crop_scale_range[1])
+        crop_h = int(h * scale)
+        crop_w = int(w * scale)
+    else:
+        # 原始尺寸裁剪
+        crop_h = h
+        crop_w = w
+
+    # 4. 从中心区域随机偏移裁剪（偏移范围限制在±0.5个原始尺寸内，保证裁剪区域完全在3x3图内）
+    # 确保裁剪区域不超出3x3图边界
+    max_offset_x = min(w // 2, (3 * w - crop_w) // 2 - 1)
+    max_offset_y = min(h // 2, (3 * h - crop_h) // 2 - 1)
+
+    crop_cx = w + np.random.randint(-max_offset_x, max_offset_x + 1)
+    crop_cy = h + np.random.randint(-max_offset_y, max_offset_y + 1)
+    x1 = crop_cx - crop_w // 2
+    y1 = crop_cy - crop_h // 2
+
+    # 边界检查
+    x1 = max(0, min(x1, 3 * w - crop_w))
+    y1 = max(0, min(y1, 3 * h - crop_h))
+
+    cropped = rotated[y1:y1 + crop_h, x1:x1 + crop_w]
+
+    # 如果裁剪尺寸与原图不同，resize回原尺寸
+    if crop_h != h or crop_w != w:
+        cropped = cv2.resize(cropped, (w, h))
+
+    return cropped
