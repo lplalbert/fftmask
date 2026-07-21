@@ -1,0 +1,42 @@
+# ── v11 训练配置 ──────────────────────────────────────────
+# 增加旋转矫正环的训练
+version: "v11"
+description: "Cb通道解码 + 旋转矫正环(r=18)"
+
+# ── 数据集 ──────────────────────────────────────────
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+train_length: 5120
+val_length: 1024
+
+# ── 模型 ──────────────────────────────────────────
+resume: "/mnt/lpl/fftmask/output/v1_valnoise/20260629_005346/models/best_cb_decoder.pth"
+output_dir: "/mnt/lpl/fftmask/output/finetune_v11"
+block_size: 512
+num_bits: 60
+r_watermark: [12, 25]
+bitsf: [15, 45]
+ring_width: 5
+
+# ── 旋转矫正环 ──────────────────────────────────────
+r_rotation: 18
+rotation_cycles: 8
+rotation_aug: true
+
+# ── 训练参数 ──────────────────────────────────────
+batch_size: 64
+epochs: 50
+lr: 0.00005
+device: "0"
+
+# ── 噪声策略 ──────────────────────────────────────
+noise_schedule:
+  - [999, 0.016, "pair"]
+
+# ── 模式 ──────────────────────────────────────────
+mode: "decoder_only"
+
+# ── 损失权重 ──────────────────────────────────────
+lambda_bit: 15.0
+lambda_rotation: 5.0
+lambda_shape: 0.04
