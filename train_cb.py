@@ -57,11 +57,14 @@ def get_tile_rotate_params(cfg):
 
 
 def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.01, noise_pool=None, max_angle=360, crop_scale_range=None):
-    """构建训练数据集（使用第一个数据源目录）"""
-    train_data_paths = cfg.get('train_data_paths', [cfg.get('train_dir')])
+    """构建训练数据集"""
+    train_dir = cfg.get('train_dir')
+    if train_dir is None:
+        train_data_paths = cfg.get('train_data_paths', [])
+        train_dir = train_data_paths[0] if train_data_paths else None
 
     return WatermarkDataset(
-        image_dir=train_data_paths[0],
+        image_dir=train_dir,
         block_size=cfg['block_size'],
         num_bits=cfg['num_bits'],
         r=cfg.get('r', [12, 25]),
@@ -72,6 +75,7 @@ def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.01, noise_po
         noise_pool=noise_pool,
         max_angle=max_angle,
         crop_scale_range=crop_scale_range,
+        max_images=cfg.get('train_length', 0),
     )
 
 
@@ -90,6 +94,7 @@ def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.01, nois
         noise_pool=noise_pool,
         max_angle=max_angle,
         crop_scale_range=crop_scale_range,
+        max_images=cfg.get('val_length', 0),
     )
 
 

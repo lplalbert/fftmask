@@ -11,7 +11,7 @@ class WatermarkDataset(Dataset):
     水印数据集
     生成带水印的图像和对应的水印标签
     """
-    def __init__(self, image_dir, block_size=512, num_bits=4, r=[3,6], bits=[5,15], alpha_embed=0.01, transform=None, noise_level='none', noise_pool=None, max_angle=180, crop_scale_range=None):
+    def __init__(self, image_dir, block_size=512, num_bits=4, r=[3,6], bits=[5,15], alpha_embed=0.01, transform=None, noise_level='none', noise_pool=None, max_angle=180, crop_scale_range=None, max_images=0):
         self.image_dir = image_dir
         self.block_size = block_size
         self.transform = transform
@@ -22,8 +22,10 @@ class WatermarkDataset(Dataset):
         self.max_angle = max_angle
         self.crop_scale_range = crop_scale_range
         self.watermark_system = Watermark16Sector1(L1=block_size, k1=30000, r=r, bitsf=bits, r_range=1,n_sectors=num_bits) #2gaiwei1
-        self.image_files = [f for f in os.listdir(image_dir) 
+        self.image_files = [f for f in os.listdir(image_dir)
                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+        if max_images > 0:
+            self.image_files = self.image_files[:max_images]
         
         # 噪声强度配置
         self.noise_config = {
