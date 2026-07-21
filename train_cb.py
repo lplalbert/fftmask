@@ -165,14 +165,13 @@ def main():
     # 构建模型
     r = cfg.get('r', [12, 25])
     bitsf = cfg.get('bitsf', [15, 45])
-    ring_width = cfg.get('ring_width', 1)
+    ring_width = cfg.get('ring_width', 5)
     rings = [(ri-ring_width, ri+ring_width) for ri in r]
 
     model = AdvancedWatermarkDecoder(
         n_sectors=cfg['num_bits'],
         rings=rings,
         bits=bitsf,
-        radius_bins=cfg.get('radius_bins', None),
     )
 
     # 加载预训练权重
