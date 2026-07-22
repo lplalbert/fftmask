@@ -22,7 +22,7 @@ ring_width: 5
 batch_size: 64
 epochs: 50
 lr: 0.00005
-device: "0"
+device: "0,1"
 
 # ── 噪声策略 ──────────────────────────────────────
 noise_schedule:

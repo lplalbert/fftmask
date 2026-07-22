@@ -5,7 +5,7 @@ import torch
 import random
 from torch.utils.data import Dataset
 from encode2 import Watermark16Sector1
-from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_tile_rotate_crop_noise
+from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_tile_rotate_crop_noise, add_wechat_noise
 class WatermarkDataset(Dataset):
     """
     水印数据集
@@ -21,6 +21,7 @@ class WatermarkDataset(Dataset):
         self.noise_pool = noise_pool
         self.max_angle = max_angle
         self.crop_scale_range = crop_scale_range
+        self.force_noise_pair = None  # 设为 (type1, type2) 可强制指定噪声组合
         self.watermark_system = Watermark16Sector1(L1=block_size, k1=30000, r=r, bitsf=bits, r_range=1,n_sectors=num_bits) #2gaiwei1
         self.image_files = [f for f in os.listdir(image_dir)
                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
@@ -139,27 +140,27 @@ class WatermarkDataset(Dataset):
                 crop_scale_range=self.crop_scale_range
             )
         elif self.noise_level == 'pair':
-            # 两两配对噪声：从低/中/高噪声中随机选两种依次应用
-            pair_configs = ['low', 'mid', 'high']
-            selected = np.random.choice(pair_configs, size=2, replace=True)
-            for sel in selected:
-                config = self.noise_config[sel]
-                noise_types = ['pimog', 'jpeg', 'tile_crop']
-                noise_type = np.random.choice(noise_types)
-
-                if noise_type == 'pimog' and config['pimog_level'] > 0:
-                    watermarked_image = add_pimog_noise(watermarked_image, noise_level=config['pimog_level'])
-                elif noise_type == 'jpeg' and config['jpeg_quality'] < 100:
-                    watermarked_image = add_jpeg_compression_noise(watermarked_image, quality=config['jpeg_quality'])
-                elif noise_type == 'tile_crop' and config['tile_crop_ratio'] > 0:
-                    # 循环平移：对水印模板进行随机平移
+            # 两两配对噪声：从 identity/wechat/tile_crop/pimog 中随机选两种不同的依次应用
+            if self.force_noise_pair is not None:
+                selected = self.force_noise_pair
+            else:
+                noise_pool = ['identity', 'wechat', 'tile_crop', 'pimog']
+                first = np.random.choice(noise_pool)
+                second_pool = [n for n in noise_pool if n != first]
+                second = np.random.choice(second_pool)
+                selected = [first, second]
+            for noise_type in selected:
+                if noise_type == 'identity':
+                    pass  # 不加噪声
+                elif noise_type == 'wechat':
+                    watermarked_image = add_wechat_noise(watermarked_image)
+                elif noise_type == 'tile_crop':
+                    # 循环平移：对已嵌入水印的图像做随机平移（不旋转）
                     shift_x = random.randint(0, self.block_size - 1)
                     shift_y = random.randint(0, self.block_size - 1)
-                    # 循环平移Tm
-                    Tm_shifted = np.roll(np.roll(Tm, shift_x, axis=1), shift_y, axis=0)
-                    # 重新嵌入
-                    watermarked_image = host_bgr.astype(np.float32) * (1 - self.alpha_embed) + Tm_shifted.astype(np.float32) * self.alpha_embed
-                    watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
+                    watermarked_image = np.roll(np.roll(watermarked_image, shift_x, axis=1), shift_y, axis=0)
+                elif noise_type == 'pimog':
+                    watermarked_image = add_pimog_noise(watermarked_image)
         elif self.noise_level != 'none':
             config = self.noise_config[self.noise_level]
 

@@ -310,15 +310,33 @@ def main():
 
         torch.cuda.empty_cache()
 
-        # 验证
+        # 验证：随机噪声 + 各噪声组合分别验证
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
 
+        # 12种噪声组合 (两种不同的噪声, 有序)
+        noise_combos = [
+            ('identity', 'wechat'),
+            ('identity', 'tile_crop'),
+            ('identity', 'pimog'),
+            ('wechat', 'identity'),
+            ('wechat', 'tile_crop'),
+            ('wechat', 'pimog'),
+            ('tile_crop', 'identity'),
+            ('tile_crop', 'wechat'),
+            ('tile_crop', 'pimog'),
+            ('pimog', 'identity'),
+            ('pimog', 'wechat'),
+            ('pimog', 'tile_crop'),
+        ]
+        combo_stats = {f'{a}+{b}': {'correct': 0, 'total': 0} for a, b in noise_combos}
+
         with torch.no_grad():
+            # 随机噪声验证 (主指标)
+            val_dataset.force_noise_pair = None
             for watermarked_image, watermark_bits, m1 in tqdm(val_loader, desc='Validating'):
-                # BGR 3通道转灰度 1通道
                 if watermarked_image.shape[1] == 3:
                     gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
                 else:
@@ -340,8 +358,43 @@ def main():
                 val_correct += correct
                 val_total += total
 
+            # 各噪声组合分别验证 (用子集 + num_workers=0 确保 force_noise_pair 生效)
+            combo_subset = min(128, len(val_dataset))
+            combo_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
+                                      num_workers=0, pin_memory=False)
+            for combo_name, combo_stats_item in tqdm(combo_stats.items(), desc='Noise combos'):
+                a, b = combo_name.split('+')
+                val_dataset.force_noise_pair = (a, b)
+                n_done = 0
+                for watermarked_image, watermark_bits, m1 in combo_loader:
+                    if watermarked_image.shape[1] == 3:
+                        gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
+                    else:
+                        gray_image = watermarked_image[:, 0:1, :, :].to(device)
+                    watermark_bits = watermark_bits.to(device)
+
+                    pred, _, _ = model(gray_image)
+                    pred_bits = (pred > 0.5).float()
+                    correct = (pred_bits == watermark_bits).sum().item()
+                    total = watermark_bits.numel()
+                    combo_stats_item['correct'] += correct
+                    combo_stats_item['total'] += total
+
+                    n_done += watermarked_image.shape[0]
+                    if n_done >= combo_subset:
+                        break
+
+        val_dataset.force_noise_pair = None
         val_loss /= len(val_loader)
         val_acc = val_correct / val_total
+
+        # 终端输出各噪声组合 acc
+        combo_acc_strs = []
+        for combo_name, stats in combo_stats.items():
+            if stats['total'] > 0:
+                acc = stats['correct'] / stats['total']
+                combo_acc_strs.append(f'{combo_name}={acc:.4f}')
+        logger.info(f'  噪声组合acc: {" | ".join(combo_acc_strs)}')
 
         scheduler.step()
 

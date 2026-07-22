@@ -435,11 +435,270 @@ def apply_noise_during_training(images, noise_prob=0.5, noise_level=0.1):
     return images
 
 
+# ── 微信压缩模拟 (向量化版本, 无 Python 循环) ──────────────────
+
+import torch
+import torch.nn.functional as F_torch
+
+# 预计算 DCT 矩阵 (8×8, 正交归一化)
+_DCT_MAT_NP = np.zeros((8, 8), dtype=np.float64)
+for u in range(8):
+    for x in range(8):
+        alpha = math.sqrt(1.0 / 8.0) if u == 0 else math.sqrt(2.0 / 8.0)
+        _DCT_MAT_NP[u, x] = alpha * math.cos((2 * x + 1) * u * math.pi / 16.0)
+_DCT_MAT_T_NP = _DCT_MAT_NP.T.copy()
+
+# 预计算高频清零掩码 (8×8, True=保留, False=置零)
+_JPEG_ZIGZAG_IDX = [
+    (0,0),(0,1),(1,0),(2,0),(1,1),(0,2),(0,3),(1,2),
+    (2,1),(3,0),(4,0),(3,1),(2,2),(1,3),(0,4),(0,5),
+    (1,4),(2,3),(3,2),(4,1),(5,0),(6,0),(5,1),(4,2),
+    (3,3),(2,4),(1,5),(0,6),(0,7),(1,6),(2,5),(3,4),
+    (4,3),(5,2),(6,1),(7,0),(7,1),(6,2),(5,3),(4,4),
+    (3,5),(2,6),(1,7),(2,7),(3,6),(4,5),(5,4),(6,3),
+    (7,2),(7,3),(6,4),(5,5),(4,6),(3,7),(4,7),(5,6),
+    (6,5),(7,4),(7,5),(6,6),(5,7),(6,7),(7,6),(7,7),
+]
+
+# 预计算各 zigzag_keep 值的掩码缓存
+_ZIGZAG_MASK_CACHE = {}
+
+def _get_zigzag_mask(zigzag_keep):
+    """获取高频清零掩码 (8,8) float64, 1.0=保留, 0.0=置零"""
+    if zigzag_keep not in _ZIGZAG_MASK_CACHE:
+        mask = np.zeros((8, 8), dtype=np.float64)
+        for k in range(min(zigzag_keep, 64)):
+            r, c = _JPEG_ZIGZAG_IDX[k]
+            mask[r, c] = 1.0
+        _ZIGZAG_MASK_CACHE[zigzag_keep] = mask
+    return _ZIGZAG_MASK_CACHE[zigzag_keep]
+
+# 标准 JPEG 亮度/色度量化表 (8×8 rowmajor, 与 wechat_jpeg_encode_once_hf_zero.py 一致)
+_Q_LUMINANCE_8x8 = np.array([
+    [13, 9, 8, 13, 19, 32, 41, 49],
+    [10, 10, 11, 15, 21, 46, 48, 44],
+    [11, 10, 13, 19, 32, 46, 55, 45],
+    [11, 14, 18, 23, 41, 70, 64, 50],
+    [14, 18, 30, 45, 54, 87, 82, 62],
+    [19, 28, 44, 51, 65, 83, 90, 74],
+    [39, 51, 62, 70, 82, 97, 96, 81],
+    [58, 74, 76, 78, 90, 80, 82, 79],
+], dtype=np.float64)
+
+_Q_CHROMINANCE_8x8 = np.array([
+    [14, 14, 19, 38, 79, 79, 79, 79],
+    [14, 17, 21, 53, 79, 79, 79, 79],
+    [19, 21, 45, 79, 79, 79, 79, 79],
+    [38, 53, 79, 79, 79, 79, 79, 79],
+    [79, 79, 79, 79, 79, 79, 79, 79],
+    [79, 79, 79, 79, 79, 79, 79, 79],
+    [79, 79, 79, 79, 79, 79, 79, 79],
+    [79, 79, 79, 79, 79, 79, 79, 79],
+], dtype=np.float64)
+
+
+def _block_dct_hf_zero_vec(plane, zigzag_keep):
+    """
+    向量化 8×8 分块 DCT → 高频清零 → IDCT (无 Python 循环)
+
+    Args:
+        plane: (H, W) float64, 值域 [0, 255]
+        zigzag_keep: 保留的之字形系数个数 (1-64)
+
+    Returns:
+        (H, W) float64, 值域 [0, 255]
+    """
+    h, w = plane.shape
+    ph = int(math.ceil(h / 8.0) * 8)
+    pw = int(math.ceil(w / 8.0) * 8)
+
+    # pad 并减去 128
+    padded = np.zeros((ph, pw), dtype=np.float64)
+    padded[:h, :w] = plane - 128.0
+
+    # reshape 为 (nbh, 8, nbw, 8) → transpose → (nbh*nbw, 8, 8)
+    nbh, nbw = ph // 8, pw // 8
+    blocks = padded.reshape(nbh, 8, nbw, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
+
+    # DCT: F = C @ f @ C.T  (批量矩阵乘法)
+    dct_coeff = np.einsum('ij,bjk,kl->bil', _DCT_MAT_NP, blocks, _DCT_MAT_T_NP)
+
+    # 高频清零
+    mask = _get_zigzag_mask(zigzag_keep)
+    dct_coeff *= mask
+
+    # IDCT: f = C.T @ F @ C
+    recon = np.einsum('ij,bjk,kl->bil', _DCT_MAT_T_NP, dct_coeff, _DCT_MAT_NP)
+
+    # reshape 回图像
+    recon = recon.reshape(nbh, nbw, 8, 8).transpose(0, 2, 1, 3).reshape(ph, pw)
+
+    return np.clip(recon[:h, :w] + 128.0, 0.0, 255.0)
+
+
+def _chroma_420_downsample_vec(plane):
+    """4:2:0 色度下采样 (向量化, 2×2 块取均值)"""
+    h, w = plane.shape
+    # pad 到偶数尺寸
+    h_even = h + (h % 2)
+    w_even = w + (w % 2)
+    padded = np.zeros((h_even, w_even), dtype=plane.dtype)
+    padded[:h, :w] = plane
+    ch, cw = h_even // 2, w_even // 2
+    return padded.reshape(ch, 2, cw, 2).mean(axis=(1, 3))
+
+
+def _chroma_420_upsample_vec(plane2, h, w):
+    """4:2:0 色度上采样 (np.repeat)"""
+    return np.repeat(np.repeat(plane2, 2, axis=0), 2, axis=1)[:h, :w]
+
+
+def _jpeg_quantize_sim(plane, qtable_8x8, quality):
+    """
+    模拟 JPEG 量化: DCT → 量化(四舍五入) → 反量化 → IDCT
+    等效于 JPEG 编码的量化损失, 但不需要真正编解码
+    """
+    h, w = plane.shape
+    ph = int(math.ceil(h / 8.0) * 8)
+    pw = int(math.ceil(w / 8.0) * 8)
+    padded = np.zeros((ph, pw), dtype=np.float64)
+    padded[:h, :w] = plane - 128.0
+
+    # 根据 quality 计算缩放因子 (标准 JPEG 缩放公式)
+    if quality < 50:
+        scale = 5000.0 / quality
+    else:
+        scale = 200.0 - 2.0 * quality
+    q_scaled = np.floor((qtable_8x8 * scale + 50.0) / 100.0)
+    q_scaled = np.clip(q_scaled, 1, 255)
+
+    nbh, nbw = ph // 8, pw // 8
+    blocks = padded.reshape(nbh, 8, nbw, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
+
+    # DCT
+    dct_coeff = np.einsum('ij,bjk,kl->bil', _DCT_MAT_NP, blocks, _DCT_MAT_T_NP)
+
+    # 量化 + 反量化
+    dct_quant = np.round(dct_coeff / q_scaled) * q_scaled
+
+    # IDCT
+    recon = np.einsum('ij,bjk,kl->bil', _DCT_MAT_T_NP, dct_quant, _DCT_MAT_NP)
+    recon = recon.reshape(nbh, nbw, 8, 8).transpose(0, 2, 1, 3).reshape(ph, pw)
+
+    return np.clip(recon[:h, :w] + 128.0, 0.0, 255.0)
+
+
+def _preprocess_hf_zero_rgb(rgb, zigzag_keep, quality):
+    """
+    RGB uint8 → 高频清零 + JPEG 量化模拟 → RGB uint8
+
+    流程: RGB → YCbCr → 4:2:0 下采样 → DCT 高频清零 → JPEG量化 → IDCT → 上采样 → RGB
+    """
+    r, g, b = rgb[..., 0].astype(np.float64), rgb[..., 1].astype(np.float64), rgb[..., 2].astype(np.float64)
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
+
+    # 4:2:0 下采样
+    cb2 = _chroma_420_downsample_vec(cb.astype(np.float64))
+    cr2 = _chroma_420_downsample_vec(cr.astype(np.float64))
+
+    # DCT 高频清零
+    yq = _block_dct_hf_zero_vec(y, zigzag_keep)
+    cbq = _block_dct_hf_zero_vec(cb2, zigzag_keep)
+    crq = _block_dct_hf_zero_vec(cr2, zigzag_keep)
+
+    # JPEG 量化模拟
+    yq = _jpeg_quantize_sim(yq, _Q_LUMINANCE_8x8, quality)
+    cbq = _jpeg_quantize_sim(cbq, _Q_CHROMINANCE_8x8, quality)
+    crq = _jpeg_quantize_sim(crq, _Q_CHROMINANCE_8x8, quality)
+
+    # 上采样 + 合并
+    hh, ww = y.shape
+    cb_up = _chroma_420_upsample_vec(cbq, hh, ww)
+    cr_up = _chroma_420_upsample_vec(crq, hh, ww)
+
+    out_r = y + 1.402 * (cr_up - 128.0)
+    out_g = y - 0.344136 * (cb_up - 128.0) - 0.714136 * (cr_up - 128.0)
+    out_b = y + 1.772 * (cb_up - 128.0)
+    out = np.stack([out_r, out_g, out_b], axis=-1)
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def _whole_plane_dct_hf_zero(plane, keep_ratio):
+    """
+    整图 DCT → 高频清零 → IDCT (快速版本, ~9ms/512x512)
+
+    Args:
+        plane: (H, W) float64, 值域 [0, 255]
+        keep_ratio: 保留低频比例 (0-1)
+
+    Returns:
+        (H, W) float64, 值域 [0, 255]
+    """
+    from scipy.fft import dctn, idctn
+    h, w = plane.shape
+    coeff = dctn(plane - 128.0, type=2, norm='ortho')
+    kh = max(1, int(h * keep_ratio ** 0.5))
+    kw = max(1, int(w * keep_ratio ** 0.5))
+    coeff[kh:, :] = 0.0
+    coeff[:, kw:] = 0.0
+    recon = idctn(coeff, type=2, norm='ortho')
+    return np.clip(recon + 128.0, 0.0, 255.0)
+
+
 def add_wechat_noise(image, quality=60, zigzag_keep=21, **kwargs):
     """
-    模拟微信JPEG压缩噪声（stub，降级为普通JPEG）
+    模拟微信JPEG压缩噪声
+
+    流程：
+    1. 下采样 512→256 再上采样 256→512 (模拟微信传输的分辨率损失)
+    2. RGB → YCbCr (BT.601) → 4:2:0 色度下采样
+    3. 整图 DCT → 高频清零 → IDCT (保留 zigzag_keep/64 比例的低频)
+    4. 色度上采样 → YCbCr → RGB
+
+    Args:
+        image: 输入图像 (H, W, C) uint8
+        quality: JPEG 编码质量 (未使用, 保留接口兼容)
+        zigzag_keep: DCT 之字形保留系数个数 (1-64), 默认 21
+
+    Returns:
+        压缩后的图像 (H, W, C) uint8
     """
-    return add_jpeg_compression_noise(image, quality=quality)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    h, w = image.shape[:2]
+
+    # 1. 下采样→上采样 (模拟微信分辨率损失)
+    small = cv2.resize(image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    image = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # 2-4. DCT 高频清零
+    keep_ratio = zigzag_keep / 64.0
+    img_f = image.astype(np.float64)
+    r, g, b = img_f[..., 0], img_f[..., 1], img_f[..., 2]
+
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
+
+    cb2 = _chroma_420_downsample_vec(cb)
+    cr2 = _chroma_420_downsample_vec(cr)
+
+    yq = _whole_plane_dct_hf_zero(y, keep_ratio)
+    cbq = _whole_plane_dct_hf_zero(cb2, keep_ratio)
+    crq = _whole_plane_dct_hf_zero(cr2, keep_ratio)
+
+    hh, ww = y.shape
+    cb_up = _chroma_420_upsample_vec(cbq, hh, ww)
+    cr_up = _chroma_420_upsample_vec(crq, hh, ww)
+
+    out_r = yq + 1.402 * (cr_up - 128.0)
+    out_g = yq - 0.344136 * (cb_up - 128.0) - 0.714136 * (cr_up - 128.0)
+    out_b = yq + 1.772 * (cb_up - 128.0)
+    out = np.stack([out_r, out_g, out_b], axis=-1)
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
 def add_perspective_noise(image, d_range=(0, 0.2)):
