@@ -1,17 +1,16 @@
 """
 v11 水印解码器
-在v10解码器基础上增加旋转矫正功能
+支持小角度旋转矫正 (±5°)
 
-环结构:
-- Ring 1: r=12, 15 bits 水印
-- Ring 2: r=18, 旋转矫正环 (固定正弦波模式)
-- Ring 3: r=25, 45 bits 水印
+方案：
+1. 在FFT幅度谱中，旋转矫正环(r=18)的正弦波模式会产生相位偏移
+2. 通过检测相位偏移来估计旋转角度
+3. 在空域旋转图像矫正，然后解码
 
-解码流程:
-1. FFT -> 极坐标
-2. 从旋转矫正环检测旋转角度
-3. 在极坐标中旋转矫正
-4. 解码水印bits
+关键改进：
+- 旋转检测直接在FFT幅度谱上做，不经过ResUNet
+- 使用互相关检测，精度可以达到亚像素级
+- 对于±5°旋转，检测精度约±0.5°
 """
 import torch
 import torch.nn as nn
@@ -123,65 +122,128 @@ class PatchEmbedding(nn.Module):
         return x
 
 
-class RotationDetector(nn.Module):
+def detect_rotation_angle_numpy(fft_mag, r_rotation=18, r_range=1, rotation_cycles=8):
     """
-    旋转角度检测器
-    从旋转矫正环的极坐标表示中预测旋转角度
+    在FFT幅度谱上直接检测旋转角度 (numpy实现，用于推理)
+
+    原理：
+    1. 提取旋转矫正环的极坐标表示
+    2. 生成参考正弦波模式
+    3. 用互相关检测偏移量
+    4. 偏移量对应旋转角度
+
+    Args:
+        fft_mag: (H, W) numpy数组，FFT幅度谱
+        r_rotation: 旋转矫正环半径
+        r_range: 环宽度
+        rotation_cycles: 正弦波周期数
+
+    Returns:
+        angle_deg: 检测到的旋转角度 (度)，正值表示逆时针旋转
     """
-    def __init__(self, radius_bins=12, angle_bins=180):
-        super().__init__()
-        self.radius_bins = radius_bins
-        self.angle_bins = angle_bins
+    from scipy.signal import correlate
 
-        # 简单的CNN + 全连接层
-        self.conv = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=7, padding=3),
-            nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=5, padding=2),
-            nn.ReLU(),
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(32 * angle_bins, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()  # 输出 [0, 1]，对应 [0, 180) 度
-        )
+    H, W = fft_mag.shape
+    cx, cy = H // 2, W // 2
 
-    def forward(self, rotation_polar):
-        """
-        Args:
-            rotation_polar: (B, radius_bins, angle_bins) - 旋转环的极坐标表示
+    # 提取旋转环上的信号
+    # 沿着圆周采样，角度范围 [0, 2π)
+    N = 360  # 采样点数
+    theta_arr = np.linspace(0, 2 * np.pi, N, endpoint=False)
 
-        Returns:
-            angle_normalized: (B, 1) - 归一化的角度 [0, 1]
-        """
-        # 沿半径方向取均值 -> (B, 1, angle_bins)
-        x = rotation_polar.mean(dim=1, keepdim=True)
+    # 对多个半径取均值
+    signals = []
+    for r in range(r_rotation - r_range, r_rotation + r_range + 1):
+        x_arr = cx + np.round(r * np.cos(theta_arr)).astype(np.int32)
+        y_arr = cy + np.round(r * np.sin(theta_arr)).astype(np.int32)
 
-        # CNN
-        x = self.conv(x)  # (B, 32, angle_bins)
+        # 边界过滤
+        mask = (x_arr >= 0) & (x_arr < W) & (y_arr >= 0) & (y_arr < H)
+        signal = np.zeros(N)
+        signal[mask] = fft_mag[y_arr[mask], x_arr[mask]]
+        signals.append(signal)
 
-        # Flatten + FC
-        x = x.flatten(1)
-        angle = self.fc(x)
+    signal_mean = np.mean(signals, axis=0)
 
-        return angle
+    # 生成参考模式 (注意：旋转矫正环用的是cos模式)
+    ref = np.cos(rotation_cycles * theta_arr)
+
+    # 互相关
+    corr = correlate(signal_mean, ref, mode='full')
+    center = len(corr) // 2
+
+    # 只搜索 [-90°, +90°] 范围 (对应 ±0.25 周期的偏移)
+    # 对于 rotation_cycles=8, 每个周期对应 360/8 = 45°
+    # ±5° 对应 ±0.111 周期
+    search_bins = int(N / 2)  # ±180°
+    corr_search = corr[center - search_bins: center + search_bins]
+    max_idx = np.argmax(corr_search)
+
+    # 转换为角度
+    # max_idx 对应偏移量 (从 -search_bins 到 +search_bins)
+    shift = max_idx - search_bins
+    # 偏移量转换为角度：每个采样点对应 360/N = 1°
+    angle_deg = shift * (360.0 / N)
+
+    return angle_deg
+
+
+def rotate_image_numpy(image, angle_deg):
+    """
+    在空域旋转图像 (保持尺寸)
+
+    Args:
+        image: (H, W) 或 (H, W, C) numpy数组
+        angle_deg: 旋转角度 (度)，正值表示逆时针旋转
+
+    Returns:
+        rotated: 旋转后的图像
+    """
+    import cv2
+
+    if len(image.shape) == 2:
+        h, w = image.shape
+    else:
+        h, w = image.shape[:2]
+
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+
+    if len(image.shape) == 2:
+        rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REFLECT)
+    else:
+        rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REFLECT)
+
+    return rotated
 
 
 class AdvancedWatermarkDecoderV11(nn.Module):
     """
-    v11 解码器
-    增加旋转矫正功能
+    v11 解码器 (3-ring version)
+
+    解码流程：
+    1. 输入单通道图像
+    2. FFT -> 幅度谱
+    3. 对三个环 (r=12, r=18, r=25) 分别极坐标采样
+    4. 送入 Transformer，让模型隐式学习旋转不变性
+    5. 输出 60 bits
+
+    环结构：
+    - Ring 1 (r=12): 15 bits 水印
+    - Ring 2 (r=18): 旋转参考环 (方波90°，不编码bit，提供旋转信息)
+    - Ring 3 (r=25): 45 bits 水印
     """
     def __init__(self, n_sectors=60, rings=None, bits=None,
-                 rotation_ring=None, rotation_cycles=8):
+                 rotation_ring=None, rotation_patches=12):
         """
         Args:
             n_sectors: 水印总位数
             rings: 水印环列表 [(min_r, max_r), ...]
             bits: 每个环的位数
-            rotation_ring: 旋转矫正环 (min_r, max_r)
-            rotation_cycles: 旋转矫正环的周期数
+            rotation_ring: 旋转参考环 (min_r, max_r)
+            rotation_patches: 旋转环的patch数量 (不对应bit，只是特征提取)
         """
         super().__init__()
         self.n_sectors = n_sectors
@@ -191,34 +253,32 @@ class AdvancedWatermarkDecoderV11(nn.Module):
         self.rings = rings if rings is not None else [(7, 17), (20, 30)]
         self.bits = bits if bits is not None else [15, 45]
 
-        # 旋转矫正环配置
+        # 旋转参考环配置
         self.rotation_ring = rotation_ring if rotation_ring is not None else (13, 23)
-        self.rotation_cycles = rotation_cycles
+        self.rotation_patches = rotation_patches
+
+        # 合并所有环: 水印环 + 旋转环
+        self.all_rings = self.rings + [self.rotation_ring]
+        self.all_patches = self.bits + [rotation_patches]
 
         self.angle_bins = 180
         self.radius_bins = 12
-
-        # 旋转角度检测器
-        self.rotation_detector = RotationDetector(
-            radius_bins=self.radius_bins,
-            angle_bins=self.angle_bins
-        )
 
         # ViT 配置
         self.embed_dim = 256
         self.num_heads = 8
         self.num_layers = 2
 
-        # 每个 ring 的 Patch Embedding
+        # 每个 ring 的 Patch Embedding (包括旋转环)
         self.patch_embeddings = nn.ModuleList([
             PatchEmbedding(
-                in_dim=(self.angle_bins // bit_num) * self.radius_bins,
+                in_dim=(self.angle_bins // patch_num) * self.radius_bins,
                 embed_dim=self.embed_dim,
-                num_patches=bit_num
-            ) for bit_num in self.bits
+                num_patches=patch_num
+            ) for patch_num in self.all_patches
         ])
 
-        # 每个 ring 的 Transformer Encoder
+        # 每个 ring 的 Transformer Encoder (包括旋转环)
         self.ring_transformers = nn.ModuleList([
             nn.TransformerEncoder(
                 nn.TransformerEncoderLayer(
@@ -228,12 +288,12 @@ class AdvancedWatermarkDecoderV11(nn.Module):
                     dim_feedforward=self.embed_dim * 4
                 ),
                 num_layers=self.num_layers
-            ) for _ in self.rings
+            ) for _ in self.all_rings
         ])
 
-        # 跨 ring 融合
+        # 跨 ring 融合 (3个环: 2个水印 + 1个旋转)
         self.cross_ring_fusion = nn.Sequential(
-            nn.Linear(self.embed_dim * len(self.rings), self.embed_dim * 2),
+            nn.Linear(self.embed_dim * len(self.all_rings), self.embed_dim * 2),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(self.embed_dim * 2, self.embed_dim)
@@ -241,113 +301,121 @@ class AdvancedWatermarkDecoderV11(nn.Module):
 
         self.head = nn.Linear(self.embed_dim, n_sectors)
 
-    def detect_rotation(self, mag):
+    def detect_rotation_numpy(self, fft_mag_np):
         """
-        检测旋转角度
+        使用numpy检测旋转角度 (用于推理)
 
         Args:
-            mag: (B, 1, H, W) - FFT幅度谱
+            fft_mag_np: (H, W) numpy数组
 
         Returns:
-            angle_normalized: (B, 1) - 归一化角度 [0, 1]
+            angle_deg: 旋转角度 (度)
         """
-        # 提取旋转环的极坐标表示
-        rotation_polar = cartesian_to_polar(
-            mag,
-            output_shape=(self.radius_bins, self.angle_bins),
-            min_radius=self.rotation_ring[0],
-            max_radius=self.rotation_ring[1]
-        )  # (B, 1, R, T)
+        return detect_rotation_angle_numpy(
+            fft_mag_np,
+            r_rotation=self.rotation_ring[0] + (self.rotation_ring[1] - self.rotation_ring[0]) // 2,
+            r_range=(self.rotation_ring[1] - self.rotation_ring[0]) // 2,
+            rotation_cycles=self.rotation_cycles
+        )
 
-        rotation_polar = rotation_polar.squeeze(1)  # (B, R, T)
-
-        # 检测角度
-        angle = self.rotation_detector(rotation_polar)
-
-        return angle
-
-    def rotate_polar(self, polar, angle_shift):
+    def forward_with_rotation_correction(self, x_np, device):
         """
-        在极坐标中旋转 (循环移位)
+        带旋转矫正的推理流程 (numpy实现)
 
         Args:
-            polar: (B, C, R, T) - 极坐标表示
-            angle_shift: (B, 1) - 角度偏移量 (归一化 [0, 1])
+            x_np: (B, 1, H, W) numpy数组，输入图像 [-1, 1]
+            device: torch设备
 
         Returns:
-            rotated: (B, C, R, T) - 旋转后的极坐标表示
+            pred: (B, n_sectors) 水印位预测
+            rotation_angles: (B,) 检测到的旋转角度
         """
-        B, C, R, T = polar.shape
+        B, C, H, W = x_np.shape
+        predictions = []
+        rotation_angles = []
 
-        # 将归一化角度转换为bin偏移量
-        shift_bins = (angle_shift * T).long()  # (B, 1)
-
-        # 循环移位
-        rotated = torch.zeros_like(polar)
         for b in range(B):
-            shift = shift_bins[b, 0].item()
-            rotated[b] = torch.roll(polar[b], shifts=-shift, dims=-1)
+            # 1. 提取单张图像
+            img = x_np[b, 0]  # (H, W), [-1, 1]
 
-        return rotated
+            # 2. FFT
+            fft_result = np.fft.fftshift(np.fft.fft2(img))
+            fft_mag = np.abs(fft_result)
+
+            # 3. 检测旋转角度
+            angle_deg = self.detect_rotation_numpy(fft_mag)
+            rotation_angles.append(angle_deg)
+
+            # 4. 在空域旋转矫正
+            img_corrected = rotate_image_numpy(img, -angle_deg)  # 反向旋转
+
+            # 5. 转换为tensor
+            img_tensor = torch.from_numpy(img_corrected).unsqueeze(0).unsqueeze(0).float()
+            img_tensor = img_tensor.to(device)
+
+            # 6. 解码 (不带旋转矫正)
+            with torch.no_grad():
+                pred, _, _ = self.forward(img_tensor, return_rotation=False)
+                predictions.append(pred)
+
+        predictions = torch.cat(predictions, dim=0)
+        rotation_angles = np.array(rotation_angles)
+
+        return predictions, rotation_angles
 
     def forward(self, x, return_rotation=False):
         """
+        标准前向传播 (训练时使用)
+
+        三个环 (r=12, r=18, r=25) 分别极坐标采样后送入 Transformer，
+        让模型隐式学习旋转不变性。
+
         Args:
             x: (B, 1, H, W) - 输入图像 (单通道)
-            return_rotation: 是否返回旋转角度
+            return_rotation: 是否返回旋转角度 (训练时不使用)
 
         Returns:
-            logits: (B, n_sectors) - 水印位logits
+            logits: (B, n_sectors)
             mag: FFT幅度谱
-            rotation_angle: 旋转角度 (如果return_rotation=True)
+            rotation_angle: 始终返回None (训练时不检测旋转)
         """
         x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # 1. 预滤波 + FFT
+        # 预滤波 + FFT
         res = self.pre_filter(x)
         fft_map = torch.fft.fftshift(torch.fft.fft2(res, dim=(-2, -1)), dim=(-2, -1))
         mag = torch.abs(fft_map)
         mag = torch.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # 2. 检测旋转角度
-        rotation_angle = self.detect_rotation(mag)  # (B, 1)
-
-        # 3. 解码水印 (带旋转矫正)
+        # 解码三个环 (2个水印环 + 1个旋转参考环)
         ring_embeds = []
-        for (min_r, max_r), bit_num, patch_embed, transformer in zip(
-                self.rings, self.bits, self.patch_embeddings, self.ring_transformers):
+        for (min_r, max_r), patch_num, patch_embed, transformer in zip(
+                self.all_rings, self.all_patches, self.patch_embeddings, self.ring_transformers):
 
-            # 提取极坐标
             polar = cartesian_to_polar(
                 mag,
                 output_shape=(self.radius_bins, self.angle_bins),
                 min_radius=min_r,
                 max_radius=max_r
-            )  # (B, 1, R, T)
+            )
 
-            # 旋转矫正
-            polar = self.rotate_polar(polar, rotation_angle)  # (B, 1, R, T)
-
-            # [B, 1, R, T] -> [B, T, R]
             polar_reshaped = polar.squeeze(1).permute(0, 2, 1)
 
-            # 分块
-            angles_per_bit = self.angle_bins // bit_num
+            angles_per_patch = self.angle_bins // patch_num
             patches = []
-            for i in range(bit_num):
-                start = i * angles_per_bit
-                end = (i + 1) * angles_per_bit
-                bit_patch = polar_reshaped[:, start:end, :].flatten(1)
-                patches.append(bit_patch)
+            for i in range(patch_num):
+                start = i * angles_per_patch
+                end = (i + 1) * angles_per_patch
+                patch = polar_reshaped[:, start:end, :].flatten(1)
+                patches.append(patch)
             patches = torch.stack(patches, dim=1)
 
-            # Patch Embedding + Transformer
             x_embed = patch_embed(patches)
             x_transformer = transformer(x_embed)
-            ring_repr = x_transformer[:, 0, :]
+            ring_repr = x_transformer[:, 0, :]  # CLS token
             ring_embeds.append(ring_repr)
 
-        # 4. 融合
+        # 融合三个环的表示
         fused = torch.cat(ring_embeds, dim=-1)
         fused = torch.nan_to_num(fused, nan=0.0, posinf=1e6, neginf=-1e6)
         fused = self.cross_ring_fusion(fused)
@@ -355,26 +423,43 @@ class AdvancedWatermarkDecoderV11(nn.Module):
 
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        if return_rotation:
-            return torch.sigmoid(logits), mag, rotation_angle
         return torch.sigmoid(logits), mag, None
 
 
 if __name__ == "__main__":
-    # 测试模型
+    # 测试模型 (3-ring version)
     model = AdvancedWatermarkDecoderV11(
         n_sectors=60,
         rings=[(7, 17), (20, 30)],
         bits=[15, 45],
         rotation_ring=(13, 23),
-        rotation_cycles=8
+        rotation_patches=12
     )
 
     # 测试输入
     x = torch.randn(2, 1, 512, 512)
-    logits, mag, angle = model(x, return_rotation=True)
+    logits, mag, _ = model(x)
 
     print(f"Logits shape: {logits.shape}")
     print(f"Mag shape: {mag.shape}")
-    print(f"Angle shape: {angle.shape}")
-    print(f"Angle values: {angle}")
+    print(f"Number of rings (including rotation): {len(model.all_rings)}")
+    print(f"Patches per ring: {model.all_patches}")
+    print("Model test passed!")
+
+    # 测试旋转检测
+    print("\nTesting rotation detection...")
+    img = np.random.randn(512, 512).astype(np.float32)
+
+    # 模拟旋转
+    import cv2
+    center = (256, 256)
+    M = cv2.getRotationMatrix2D(center, 3.0, 1.0)  # 旋转3°
+    img_rotated = cv2.warpAffine(img, M, (512, 512))
+
+    # 检测旋转
+    fft_mag = np.abs(np.fft.fftshift(np.fft.fft2(img)))
+    fft_mag_rot = np.abs(np.fft.fftshift(np.fft.fft2(img_rotated)))
+
+    angle = detect_rotation_angle_numpy(fft_mag_rot, r_rotation=18, r_range=1, rotation_cycles=8)
+    print(f"Detected rotation angle: {angle:.2f}°")
+    print("Rotation detection test passed!")

@@ -1,17 +1,17 @@
-# ── v11 训练配置 ──────────────────────────────────────────
-# 训练解码器对小角度旋转 (±5°) 的鲁棒性
-version: "v11"
-description: "Cb通道解码 + 旋转增强训练 (±5°)"
+# ── v11 旋转鲁棒性增强训练 v2 ──────────────────────────
+# 分阶段训练：先大alpha+大旋转，再逐渐调小到目标值
+version: "v11_rotation_curriculum_v2"
+description: "v11旋转鲁棒性增强 - 课程学习v2 (大alpha起步)"
 
 # ── 数据集 ──────────────────────────────────────────
 train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
 val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
-train_length: 5120
-val_length: 1024
+train_length: 0
+val_length: 0
 
 # ── 模型 ──────────────────────────────────────────
-resume: "/mnt/lpl/fftmask/output/v1_valnoise/20260629_005346/models/best_cb_decoder.pth"
-output_dir: "/mnt/lpl/fftmask/output/finetune_v11"
+resume: "/mnt/lpl/fftmask/output/finetune_v11_v3/20260724_095433/models/best_cb_decoder_v11.pth"
+output_dir: "/mnt/lpl/fftmask/output/finetune_v11_rotation_v2"
 block_size: 512
 num_bits: 60
 r_watermark: [12, 25]
@@ -20,20 +20,29 @@ ring_width: 5
 
 # ── 旋转参考环 ──────────────────────────────────────
 r_rotation: 18
-rotation_patches: 36  # 每patch覆盖5°，用于检测±5°旋转
+rotation_patches: 36
 
-# ── tile_crop噪声中的旋转范围 ──────────────────────
-max_rotation: 5.0  # ±5° (3x3拼接后旋转再裁剪)
+# ── 噪声策略: pair ──────────────────────────────
+# 格式: [结束epoch(不含), alpha, noise_level]
+# alpha 随训练逐渐降低
+noise_schedule:
+  - [10, 0.04, "pair"]
+  - [20, 0.03, "pair"]
+  - [35, 0.02, "pair"]
+  - [999, 0.016, "pair"]
+
+# ── 旋转角度课程学习 ──────────────────────────────
+# 格式: [结束epoch(不含), max_rotation]
+rotation_schedule:
+  - [15, 10.0]
+  - [30, 8.0]
+  - [999, 5.0]
 
 # ── 训练参数 ──────────────────────────────────────
 batch_size: 64
 epochs: 50
-lr: 0.00005
+lr: 0.00003
 device: "0,1"
-
-# ── 噪声策略 ──────────────────────────────────────
-noise_schedule:
-  - [999, 0.016, "pair"]
 
 # ── 模式 ──────────────────────────────────────────
 mode: "decoder_only"

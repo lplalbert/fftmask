@@ -1,6 +1,6 @@
 """
 v11 Cb通道解码训练脚本
-增加旋转矫正能力的训练
+训练解码器对小角度旋转 (±5°) 的鲁棒性
 
 用法：
     python train_cb_v11.py --config config/train_cb_v11.yaml
@@ -57,6 +57,25 @@ def get_tile_rotate_params(cfg):
     return max_angle, crop_scale_range
 
 
+def get_rotation_schedule(cfg, epoch):
+    """获取当前epoch的旋转角度配置
+
+    rotation_schedule 格式: [[结束epoch, max_rotation], ...]
+    例如: [[10, 10.0], [20, 8.0], [999, 5.0]]
+    表示 epoch 0-9 用 max_rotation=10, epoch 10-19 用 8, epoch 20+ 用 5
+    """
+    schedule = cfg.get('rotation_schedule', None)
+    if schedule is None:
+        return cfg.get('max_rotation', 5.0)
+
+    for entry in schedule:
+        end_epoch = entry[0]
+        if epoch < end_epoch:
+            return entry[1]
+
+    return schedule[-1][1]
+
+
 def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                   noise_pool=None, max_angle=360, crop_scale_range=None):
     """构建训练数据集"""
@@ -76,7 +95,7 @@ def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         noise_pool=noise_pool,
         max_angle=max_angle,
         crop_scale_range=crop_scale_range,
-        rotation_aug=cfg.get('rotation_aug', True),
+        max_rotation=cfg.get('max_rotation', 5.0),
         max_images=cfg.get('train_length', 0),
     )
 
@@ -99,7 +118,7 @@ def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         noise_pool=noise_pool,
         max_angle=max_angle,
         crop_scale_range=crop_scale_range,
-        rotation_aug=cfg.get('rotation_aug', True),
+        max_rotation=cfg.get('max_rotation', 5.0),
         max_images=cfg.get('val_length', 0),
     )
 
@@ -191,7 +210,7 @@ def main():
         rings=rings,
         bits=bitsf,
         rotation_ring=rotation_ring,
-        rotation_cycles=cfg.get('rotation_cycles', 8),
+        rotation_patches=cfg.get('rotation_patches', 12),
     )
 
     # 加载预训练权重
@@ -204,7 +223,7 @@ def main():
             state_dict = ckpt
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-        # 只加载匹配的权重 (旋转检测器的权重是新的，不会加载)
+        # 只加载匹配的权重
         model_dict = model.state_dict()
         pretrained_dict = {k: v for k, v in state_dict.items()
                           if k in model_dict and v.shape == model_dict[k].shape}
@@ -253,7 +272,6 @@ def main():
 
     # 损失函数权重
     lambda_bit = cfg.get('lambda_bit', 15.0)
-    lambda_rotation = cfg.get('lambda_rotation', 5.0)
     lambda_shape = cfg.get('lambda_shape', 0.0)
 
     best_val_loss = float('inf')
@@ -265,11 +283,13 @@ def main():
         # 获取当前噪声配置
         alpha_embed, noise_level, noise_pool, _ = get_noise_schedule(cfg, epoch)
         tile_max_angle, tile_crop_scale_range = get_tile_rotate_params(cfg)
+        max_rotation = get_rotation_schedule(cfg, epoch)
 
         train_dataset.alpha_embed = alpha_embed
         train_dataset.noise_level = noise_level if isinstance(noise_level, str) else 'none'
         train_dataset.max_angle = tile_max_angle
         train_dataset.crop_scale_range = tile_crop_scale_range
+        train_dataset.max_rotation = max_rotation
         if noise_pool is not None:
             train_dataset.noise_pool = noise_pool
 
@@ -281,39 +301,30 @@ def main():
         # 训练
         model.train()
         train_loss = 0.0
-        train_bit_correct = 0
-        train_bit_total = 0
-        train_rotation_error = 0.0
-        train_rotation_count = 0
+        train_correct = 0
+        train_total = 0
 
         grad_accum_steps = cfg.get('grad_accum_steps', 1)
         optimizer.zero_grad()
 
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
-        for batch_idx, (watermarked_image, watermark_bits, rotation_angle) in enumerate(train_pbar):
+        for batch_idx, (watermarked_image, watermark_bits) in enumerate(train_pbar):
             # BGR 3通道转灰度 1通道
             if watermarked_image.shape[1] == 3:
                 gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
             else:
                 gray_image = watermarked_image[:, 0:1, :, :].to(device)
             watermark_bits = watermark_bits.to(device)
-            rotation_angle = rotation_angle.to(device)
 
             # 前向传播
-            pred, mag, pred_rotation = model(gray_image, return_rotation=True)
+            pred, mag, _ = model(gray_image, return_rotation=False)
 
-            # 水印位损失 (BCE)
+            # BCE损失
             pred_safe = torch.clamp(pred, 1e-7, 1 - 1e-7)
             bce_loss = nn.functional.binary_cross_entropy(pred_safe, watermark_bits)
 
-            # 旋转角度损失 (MSE)
-            rotation_loss = nn.functional.mse_loss(pred_rotation, rotation_angle)
-
-            # 总损失
             shape_loss = torch.tensor(0.0, device=device)
-            loss = (lambda_bit * bce_loss +
-                    lambda_rotation * rotation_loss +
-                    lambda_shape * shape_loss)
+            loss = lambda_bit * bce_loss + lambda_shape * shape_loss
             loss = loss / grad_accum_steps
 
             loss.backward()
@@ -326,72 +337,105 @@ def main():
 
             train_loss += loss.item() * grad_accum_steps
 
-            # 水印位准确率
             pred_bits = (pred > 0.5).float()
             correct = (pred_bits == watermark_bits).sum().item()
             total = watermark_bits.numel()
-            train_bit_correct += correct
-            train_bit_total += total
+            train_correct += correct
+            train_total += total
 
-            # 旋转角度误差
-            rotation_error = torch.abs(pred_rotation - rotation_angle).mean().item()
-            train_rotation_error += rotation_error
-            train_rotation_count += 1
-
-            current_acc = train_bit_correct / train_bit_total
-            current_rot_err = train_rotation_error / train_rotation_count * 180  # 转换为度
-            train_pbar.set_postfix({
-                'loss': f'{loss.item() * grad_accum_steps:.4f}',
-                'bit_acc': f'{current_acc:.4f}',
-                'rot_err': f'{current_rot_err:.1f}°'
-            })
+            current_acc = train_correct / train_total
+            train_pbar.set_postfix({'loss': f'{loss.item() * grad_accum_steps:.4f}', 'acc': f'{current_acc:.4f}'})
 
         train_loss /= len(train_loader)
-        train_bit_acc = train_bit_correct / train_bit_total
-        train_rotation_error = train_rotation_error / train_rotation_count * 180  # 度
+        train_acc = train_correct / train_total
 
         torch.cuda.empty_cache()
 
-        # 验证
+        # 验证：随机噪声 + 各噪声组合分别验证
         model.eval()
         val_loss = 0.0
-        val_bit_correct = 0
-        val_bit_total = 0
-        val_rotation_error = 0.0
-        val_rotation_count = 0
+        val_correct = 0
+        val_total = 0
+
+        # 12种噪声组合 (两种不同的噪声, 有序)
+        noise_combos = [
+            ('identity', 'wechat'),
+            ('identity', 'tile_crop'),
+            ('identity', 'pimog'),
+            ('wechat', 'identity'),
+            ('wechat', 'tile_crop'),
+            ('wechat', 'pimog'),
+            ('tile_crop', 'identity'),
+            ('tile_crop', 'wechat'),
+            ('tile_crop', 'pimog'),
+            ('pimog', 'identity'),
+            ('pimog', 'wechat'),
+            ('pimog', 'tile_crop'),
+        ]
+        combo_stats = {f'{a}+{b}': {'correct': 0, 'total': 0} for a, b in noise_combos}
 
         with torch.no_grad():
-            for watermarked_image, watermark_bits, rotation_angle in tqdm(val_loader, desc='Validating'):
+            # 随机噪声验证 (主指标)
+            val_dataset.force_noise_pair = None
+            for watermarked_image, watermark_bits in tqdm(val_loader, desc='Validating'):
                 if watermarked_image.shape[1] == 3:
                     gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
                 else:
                     gray_image = watermarked_image[:, 0:1, :, :].to(device)
                 watermark_bits = watermark_bits.to(device)
-                rotation_angle = rotation_angle.to(device)
 
-                pred, mag, pred_rotation = model(gray_image, return_rotation=True)
+                pred, mag, _ = model(gray_image, return_rotation=False)
 
                 pred_safe = torch.clamp(pred, 1e-7, 1 - 1e-7)
                 bce_loss = nn.functional.binary_cross_entropy(pred_safe, watermark_bits)
-                rotation_loss = nn.functional.mse_loss(pred_rotation, rotation_angle)
                 shape_loss = torch.tensor(0.0, device=device)
-                loss = lambda_bit * bce_loss + lambda_rotation * rotation_loss + lambda_shape * shape_loss
+                loss = lambda_bit * bce_loss + lambda_shape * shape_loss
 
                 val_loss += loss.item()
 
                 pred_bits = (pred > 0.5).float()
                 correct = (pred_bits == watermark_bits).sum().item()
                 total = watermark_bits.numel()
-                val_bit_correct += correct
-                val_bit_total += total
+                val_correct += correct
+                val_total += total
 
-                rotation_error = torch.abs(pred_rotation - rotation_angle).mean().item()
-                val_rotation_error += rotation_error
-                val_rotation_count += 1
+            # 各噪声组合分别验证 (用子集 + num_workers=0 确保 force_noise_pair 生效)
+            combo_subset = min(128, len(val_dataset))
+            combo_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
+                                      num_workers=0, pin_memory=False)
+            for combo_name, combo_stats_item in tqdm(combo_stats.items(), desc='Noise combos'):
+                a, b = combo_name.split('+')
+                val_dataset.force_noise_pair = (a, b)
+                n_done = 0
+                for watermarked_image, watermark_bits in combo_loader:
+                    if watermarked_image.shape[1] == 3:
+                        gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
+                    else:
+                        gray_image = watermarked_image[:, 0:1, :, :].to(device)
+                    watermark_bits = watermark_bits.to(device)
 
+                    pred, _, _ = model(gray_image, return_rotation=False)
+                    pred_bits = (pred > 0.5).float()
+                    correct = (pred_bits == watermark_bits).sum().item()
+                    total = watermark_bits.numel()
+                    combo_stats_item['correct'] += correct
+                    combo_stats_item['total'] += total
+
+                    n_done += watermarked_image.shape[0]
+                    if n_done >= combo_subset:
+                        break
+
+        val_dataset.force_noise_pair = None
         val_loss /= len(val_loader)
-        val_bit_acc = val_bit_correct / val_bit_total
-        val_rotation_error = val_rotation_error / val_rotation_count * 180  # 度
+        val_acc = val_correct / val_total
+
+        # 终端输出各噪声组合 acc
+        combo_acc_strs = []
+        for combo_name, stats in combo_stats.items():
+            if stats['total'] > 0:
+                acc = stats['correct'] / stats['total']
+                combo_acc_strs.append(f'{combo_name}={acc:.4f}')
+        logger.info(f'  Noise combo acc: {" | ".join(combo_acc_strs)}')
 
         scheduler.step()
 
@@ -400,20 +444,16 @@ def main():
         # 日志
         logger.info(
             f'Epoch {epoch+1}/{epochs} | '
-            f'alpha={alpha_embed:.3f} noise={noise_level} | '
-            f'train_loss={train_loss:.4f} val_loss={val_loss:.4f} | '
-            f'train_bit_acc={train_bit_acc:.4f} val_bit_acc={val_bit_acc:.4f} | '
-            f'train_rot_err={train_rotation_error:.1f}° val_rot_err={val_rotation_error:.1f}° | '
+            f'alpha={alpha_embed:.3f} noise={noise_level} rot=±{max_rotation:.1f}° | '
+            f'train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} | '
             f'{epoch_time:.1f}s'
         )
 
         # Tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('BitAcc/train', train_bit_acc, epoch)
-        writer.add_scalar('BitAcc/val', val_bit_acc, epoch)
-        writer.add_scalar('RotError/train', train_rotation_error, epoch)
-        writer.add_scalar('RotError/val', val_rotation_error, epoch)
+        writer.add_scalar('Acc/train', train_acc, epoch)
+        writer.add_scalar('Acc/val', val_acc, epoch)
         writer.add_scalar('LR', scheduler.get_last_lr()[0], epoch)
 
         # 保存最佳模型

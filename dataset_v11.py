@@ -1,6 +1,6 @@
 """
 v11 水印数据集
-在v10数据集基础上增加旋转增强
+支持随机旋转增强 (±5°)，训练解码器对小角度旋转的鲁棒性
 """
 import os
 import cv2
@@ -9,13 +9,13 @@ import torch
 import random
 from torch.utils.data import Dataset
 from encode_v11 import WatermarkV11
-from noise_utils import add_pimog_noise, add_jpeg_compression_noise
+from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_wechat_noise, add_tile_rotate_crop_noise
 
 
 class WatermarkDatasetV11(Dataset):
     """
     v11 水印数据集
-    支持随机旋转增强，用于训练旋转矫正能力
+    支持随机旋转增强 (±5°)
     """
     def __init__(self, image_dir, block_size=512, num_bits=60,
                  r_watermark=[12, 25], bitsf=[15, 45],
@@ -23,7 +23,8 @@ class WatermarkDatasetV11(Dataset):
                  alpha_embed=0.016, transform=None,
                  noise_level='none', noise_pool=None,
                  max_angle=360, crop_scale_range=None,
-                 rotation_aug=True, max_images=0):
+                 max_rotation=5.0,
+                 max_images=0):
         """
         Args:
             image_dir: 图像目录
@@ -39,7 +40,7 @@ class WatermarkDatasetV11(Dataset):
             noise_pool: 噪声池
             max_angle: 最大旋转角度
             crop_scale_range: 裁剪缩放范围
-            rotation_aug: 是否启用旋转增强
+            max_rotation: 最大旋转角度 (度，用于tile_crop噪声)
             max_images: 最大图像数
         """
         self.image_dir = image_dir
@@ -51,7 +52,8 @@ class WatermarkDatasetV11(Dataset):
         self.noise_pool = noise_pool
         self.max_angle = max_angle
         self.crop_scale_range = crop_scale_range
-        self.rotation_aug = rotation_aug
+        self.max_rotation = max_rotation
+        self.force_noise_pair = None  # 设为 (type1, type2) 可强制指定噪声组合
 
         # 水印生成器
         self.watermark_system = WatermarkV11(
@@ -101,7 +103,7 @@ class WatermarkDatasetV11(Dataset):
         }
 
         # 验证噪声强度参数
-        valid_levels = list(self.noise_config.keys()) + ['pair']
+        valid_levels = list(self.noise_config.keys()) + ['pair', 'fixed_triple']
         if self.noise_level not in valid_levels:
             raise ValueError(f"noise_level must be one of: {valid_levels}")
 
@@ -176,40 +178,44 @@ class WatermarkDatasetV11(Dataset):
         watermarked_image = cv2.cvtColor(ycrcb_wm, cv2.COLOR_YCrCb2BGR)
         watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
 
-        # 随机旋转增强 (训练旋转矫正能力)
-        rotation_angle = 0.0
-        if self.rotation_aug:
-            rotation_angle = random.uniform(0, 180)  # [0, 180) 度
-            watermarked_image = self.rotate_image(watermarked_image, rotation_angle)
-
         # 添加噪声
         if self.noise_level == 'tile_rotate':
-            from noise_utils import add_tile_rotate_crop_noise
             watermarked_image = add_tile_rotate_crop_noise(
                 watermarked_image,
                 angle_range=(-self.max_angle, self.max_angle),
                 crop_scale_range=self.crop_scale_range
             )
         elif self.noise_level == 'pair':
-            # 两两配对噪声
-            pair_configs = ['low', 'mid', 'high']
-            selected = np.random.choice(pair_configs, size=2, replace=True)
-            for sel in selected:
-                config = self.noise_config[sel]
-                noise_types = ['pimog', 'jpeg', 'tile_crop']
-                noise_type = np.random.choice(noise_types)
-
-                if noise_type == 'pimog' and config['pimog_level'] > 0:
-                    watermarked_image = add_pimog_noise(watermarked_image, noise_level=config['pimog_level'])
-                elif noise_type == 'jpeg' and config['jpeg_quality'] < 100:
-                    watermarked_image = add_jpeg_compression_noise(watermarked_image, quality=config['jpeg_quality'])
-                elif noise_type == 'tile_crop' and config['tile_crop_ratio'] > 0:
-                    # 循环平移
-                    shift_x = random.randint(0, self.block_size - 1)
-                    shift_y = random.randint(0, self.block_size - 1)
-                    Tm_shifted = np.roll(np.roll(Tm, shift_x, axis=1), shift_y, axis=0)
-                    watermarked_image = host_bgr.astype(np.float32) * (1 - self.alpha_embed) + Tm_shifted.astype(np.float32) * self.alpha_embed
-                    watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
+            # 两两配对噪声：从 identity/wechat/tile_crop/pimog 中随机选两种不同的依次应用
+            if self.force_noise_pair is not None:
+                selected = self.force_noise_pair
+            else:
+                noise_pool = ['identity', 'wechat', 'tile_crop', 'pimog']
+                first = np.random.choice(noise_pool)
+                second_pool = [n for n in noise_pool if n != first]
+                second = np.random.choice(second_pool)
+                selected = [first, second]
+            for noise_type in selected:
+                if noise_type == 'identity':
+                    pass  # 不加噪声
+                elif noise_type == 'wechat':
+                    watermarked_image = add_wechat_noise(watermarked_image)
+                elif noise_type == 'tile_crop':
+                    # 3x3拼接 + 旋转 + 裁剪 (循环平移+旋转 combined)
+                    watermarked_image = add_tile_rotate_crop_noise(
+                        watermarked_image,
+                        angle_range=(-self.max_rotation, self.max_rotation)
+                    )
+                elif noise_type == 'pimog':
+                    watermarked_image = add_pimog_noise(watermarked_image)
+        elif self.noise_level == 'fixed_triple':
+            # 固定三重噪声: tile_crop → pimog → wechat
+            watermarked_image = add_tile_rotate_crop_noise(
+                watermarked_image,
+                angle_range=(-self.max_rotation, self.max_rotation)
+            )
+            watermarked_image = add_pimog_noise(watermarked_image)
+            watermarked_image = add_wechat_noise(watermarked_image)
         elif self.noise_level != 'none':
             config = self.noise_config[self.noise_level]
             noise_types = ['none', 'pimog', 'jpeg', 'tile_crop']
@@ -234,37 +240,9 @@ class WatermarkDatasetV11(Dataset):
         cb_out = ycrcb_out[:, :, 2]  # Cb通道
         watermarked_image = cb_out[..., np.newaxis]  # (H, W, 1)
 
-        # 归一化旋转角度到 [0, 1]
-        rotation_angle_normalized = rotation_angle / 180.0
-
         if self.transform:
             watermarked_image = self.transform(watermarked_image)
 
         watermark_tensor = torch.tensor(watermark_bits, dtype=torch.float32)
-        rotation_tensor = torch.tensor([rotation_angle_normalized], dtype=torch.float32)
 
-        return watermarked_image, watermark_tensor, rotation_tensor
-
-
-if __name__ == "__main__":
-    # 测试数据集
-    from torchvision import transforms
-
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5]),
-    ])
-
-    # 注意：需要有图像目录才能测试
-    # dataset = WatermarkDatasetV11(
-    #     image_dir="/path/to/images",
-    #     block_size=512,
-    #     transform=transform,
-    #     rotation_aug=True
-    # )
-    # print(f"Dataset size: {len(dataset)}")
-    # img, bits, angle = dataset[0]
-    # print(f"Image shape: {img.shape}")
-    # print(f"Bits shape: {bits.shape}")
-    # print(f"Angle: {angle}")
+        return watermarked_image, watermark_tensor
