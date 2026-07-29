@@ -42,39 +42,49 @@ class WatermarkV11:
 
     def generate_rotation_pattern(self):
         """
-        生成旋转矫正环的固定模式
-        使用正弦波，旋转角度会导致相位偏移
+        生成旋转检测环: 方波模式 (黑白交替各90°, 共轭对称)
+
+        模式:
+        - 0°-90°:   亮 (k1)
+        - 90°-180°: 暗 (0)
+        - 180°-270°: 亮 (k1)  ← 共轭对称
+        - 270°-360°: 暗 (0)   ← 共轭对称
+
+        共轭对称保证 FFT 幅度谱在 θ 和 θ+180° 处相同。
         """
         pattern = np.zeros((self.L1, self.L1), dtype=np.float32)
         cx, cy = self.L1 // 2, self.L1 // 2
 
-        for thetar in range(self.r_rotation, self.r_rotation + self.r_range + 1):
-            ri = thetar
-            # 采样点数
-            N = max(2, int(ri * 20))
+        for r in range(self.r_rotation, self.r_rotation + self.r_range + 1):
+            N = max(2, int(r * 20))
             theta_arr = np.linspace(0, 2 * np.pi, N, endpoint=False)
 
-            # 正弦波模式：rotation_cycles个周期
-            # 值在 [-1, 1] 之间
-            sin_values = np.cos(self.rotation_cycles * theta_arr)
+            # 方波: 0-90°亮, 90-180°暗, 180-270°亮, 270-360°暗
+            values = np.zeros(N, dtype=np.float32)
+            for i, theta in enumerate(theta_arr):
+                theta_deg = np.degrees(theta) % 360
+                if theta_deg < 90 or (180 <= theta_deg < 270):
+                    values[i] = self.k1  # 亮
+                else:
+                    values[i] = 0  # 暗
 
             # 坐标
-            x_arr = cx + np.round(ri * np.cos(theta_arr)).astype(np.int32)
-            y_arr = cy + np.round(ri * np.sin(theta_arr)).astype(np.int32)
+            x_arr = cx + np.round(r * np.cos(theta_arr)).astype(np.int32)
+            y_arr = cy + np.round(r * np.sin(theta_arr)).astype(np.int32)
 
             # 边界过滤
             mask = (x_arr >= 0) & (x_arr < self.L1) & (y_arr >= 0) & (y_arr < self.L1)
             x_arr = x_arr[mask]
             y_arr = y_arr[mask]
-            sin_values = sin_values[mask]
+            values = values[mask]
 
-            # 赋值 (映射到 [0, k1])
-            pattern[y_arr, x_arr] = self.k1 * (sin_values + 1) / 2
+            # 赋值
+            pattern[y_arr, x_arr] = values
 
             # 共轭对称
             x_sym = (-x_arr) % self.L1
             y_sym = (-y_arr) % self.L1
-            pattern[y_sym, x_sym] = pattern[y_arr, x_arr]
+            pattern[y_sym, x_sym] = values
 
         return pattern
 
