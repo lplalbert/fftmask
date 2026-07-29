@@ -309,15 +309,12 @@ def main():
 
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
         for batch_idx, (watermarked_image, watermark_bits) in enumerate(train_pbar):
-            # BGR 3通道转灰度 1通道
-            if watermarked_image.shape[1] == 3:
-                gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
-            else:
-                gray_image = watermarked_image[:, 0:1, :, :].to(device)
+            # dataset输出已是Cb单通道，直接使用
+            cb_image = watermarked_image.to(device)
             watermark_bits = watermark_bits.to(device)
 
             # 前向传播
-            pred, mag, _ = model(gray_image, return_rotation=False)
+            pred, mag, _ = model(cb_image, return_rotation=False)
 
             # BCE损失
             pred_safe = torch.clamp(pred, 1e-7, 1 - 1e-7)
@@ -378,13 +375,10 @@ def main():
             # 随机噪声验证 (主指标)
             val_dataset.force_noise_pair = None
             for watermarked_image, watermark_bits in tqdm(val_loader, desc='Validating'):
-                if watermarked_image.shape[1] == 3:
-                    gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
-                else:
-                    gray_image = watermarked_image[:, 0:1, :, :].to(device)
+                cb_image = watermarked_image.to(device)
                 watermark_bits = watermark_bits.to(device)
 
-                pred, mag, _ = model(gray_image, return_rotation=False)
+                pred, mag, _ = model(cb_image, return_rotation=False)
 
                 pred_safe = torch.clamp(pred, 1e-7, 1 - 1e-7)
                 bce_loss = nn.functional.binary_cross_entropy(pred_safe, watermark_bits)
@@ -408,13 +402,10 @@ def main():
                 val_dataset.force_noise_pair = (a, b)
                 n_done = 0
                 for watermarked_image, watermark_bits in combo_loader:
-                    if watermarked_image.shape[1] == 3:
-                        gray_image = watermarked_image.mean(dim=1, keepdim=True).to(device)
-                    else:
-                        gray_image = watermarked_image[:, 0:1, :, :].to(device)
+                    cb_image = watermarked_image.to(device)
                     watermark_bits = watermark_bits.to(device)
 
-                    pred, _, _ = model(gray_image, return_rotation=False)
+                    pred, _, _ = model(cb_image, return_rotation=False)
                     pred_bits = (pred > 0.5).float()
                     correct = (pred_bits == watermark_bits).sum().item()
                     total = watermark_bits.numel()
