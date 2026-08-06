@@ -345,43 +345,32 @@ def run_batched_decode(args, model, device, image_path, image_idx, channel, cand
 
     crop_channels = []
     candidate_slices = []
+
+    h_orig, w_orig = image.shape[:2]
+    wm_size_default = min(h_orig, w_orig) // 2  # 默认水印嵌入尺寸
+
     for candidate in candidates:
-        crop_size = args.crop_size  # Always 512
-        min_edge = candidate.get("min_edge", None)
+        # wm_size: 裁剪块大小，然后resize到512x512
+        wm_size = candidate.get("crop_size", wm_size_default)
+        if wm_size > min(h_orig, w_orig):
+            wm_size = min(h_orig, w_orig)
 
-        if min_edge:
-            # Resize so shortest edge equals min_edge
-            h_orig, w_orig = image.shape[:2]
-            short_side = min(h_orig, w_orig)
-            scale = min_edge / short_side
-            new_w = max(crop_size, int(round(w_orig * scale)))
-            new_h = max(crop_size, int(round(h_orig * scale)))
-            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            # Original behavior: resize to candidate's tile_size as shortest edge
-            tile_size = candidate.get("crop_size", args.crop_size)
-            h_orig, w_orig = image.shape[:2]
-            short_side = min(h_orig, w_orig)
-            scale = tile_size / short_side
-            new_w = max(crop_size, int(round(w_orig * scale)))
-            new_h = max(crop_size, int(round(h_orig * scale)))
-            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-        h, w = resized.shape[:2]
-
-        # Random crop positions from the resized image
+        # 在原图上裁剪wm_size x wm_size的块
         positions = make_crop_positions(
-            h,
-            w,
-            crop_size,
+            h_orig,
+            w_orig,
+            wm_size,
             args.num_crops,
             args.seed + image_idx,
             args.sample_mode,
         )
         start = len(crop_channels)
-        channel_image = extract_channel(resized, channel)
+        channel_image = extract_channel(image, channel)
         for y, x in positions:
-            crop = channel_image[y:y + crop_size, x:x + crop_size].copy()
+            # 裁剪wm_size x wm_size
+            crop_large = channel_image[y:y + wm_size, x:x + wm_size].copy()
+            # resize到512x512
+            crop = cv2.resize(crop_large, (args.crop_size, args.crop_size), interpolation=cv2.INTER_AREA)
             crop_channels.append(crop)
         end = len(crop_channels)
         candidate_slices.append((candidate, start, end))
