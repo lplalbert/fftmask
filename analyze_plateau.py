@@ -96,23 +96,44 @@ def decode_at_angle(image, angle, wm_size, model, device):
     return vote_str, pred
 
 
-def find_plateaus(results):
+def hamming(a, b):
+    """计算两个序列的汉明距离"""
+    return sum(x != y for x, y in zip(a, b))
+
+
+def find_plateaus(results, threshold=5):
     """
-    根据解码序列划分平台期。
-    返回: [(seq, [angles], length), ...]
+    根据解码序列的相似性划分平台期（模糊聚类）。
+    相邻角度汉明距离≤threshold → 同一平台期。
+    返回: [(consensus_seq, [angles], length), ...]
     """
+    from collections import Counter
     plateaus = []
-    cur_seq = results[0][1]
+    cur_seqs = [results[0][1]]
     cur_angles = [results[0][0]]
     for angle, seq in results[1:]:
-        if seq == cur_seq:
+        # 与当前平台期的共识序列比较
+        consensus = get_consensus(cur_seqs)
+        if hamming(seq, consensus) <= threshold:
             cur_angles.append(angle)
+            cur_seqs.append(seq)
         else:
-            plateaus.append((cur_seq, list(cur_angles), len(cur_angles)))
-            cur_seq = seq
+            plateaus.append((consensus, list(cur_angles), len(cur_angles)))
+            cur_seqs = [seq]
             cur_angles = [angle]
-    plateaus.append((cur_seq, list(cur_angles), len(cur_angles)))
+    plateaus.append((get_consensus(cur_seqs), list(cur_angles), len(cur_angles)))
     return plateaus
+
+
+def get_consensus(seqs):
+    """取每个bit位的众数作为共识序列"""
+    from collections import Counter
+    n = len(seqs[0])
+    bits = []
+    for i in range(n):
+        cnt = Counter(s[i] for s in seqs)
+        bits.append(cnt.most_common(1)[0][0])
+    return "".join(bits)
 
 
 if __name__ == "__main__":
@@ -127,6 +148,8 @@ if __name__ == "__main__":
     ap.add_argument("--angle-min", type=float, default=-5.0)
     ap.add_argument("--angle-max", type=float, default=5.0)
     ap.add_argument("--angle-step", type=float, default=0.2)
+    ap.add_argument("--threshold", type=int, default=5,
+                    help="汉明距离阈值，≤此值视为同一平台期（默认5）")
     ap.add_argument("--show-all", action="store_true",
                     help="显示所有角度的解码结果")
     args = ap.parse_args()
@@ -155,7 +178,7 @@ if __name__ == "__main__":
     print(f"Found {len(images)} images")
     print(f"GT:  {gt_str} ({len(gt_str)} bits)")
     print(f"角度范围: {args.angle_min:.1f}° ~ {args.angle_max:.1f}°, "
-          f"步长: {args.angle_step:.1f}°\n")
+          f"步长: {args.angle_step:.1f}°, 汉明距离阈值: {args.threshold}\n")
 
     angles = np.arange(args.angle_min,
                        args.angle_max + args.angle_step / 2,
@@ -197,8 +220,9 @@ if __name__ == "__main__":
                     acc_str += " ✓"
                 print(f"{angle:+6.1f}°  {acc_str}  {seq}")
 
-        # 找平台期
-        plateaus = find_plateaus([(a, s) for a, s, _ in results])
+        # 找平台期（模糊聚类）
+        plateaus = find_plateaus([(a, s) for a, s, _ in results],
+                                threshold=args.threshold)
 
         # 计算每个平台期的准确率
         plateaus_with_acc = []
