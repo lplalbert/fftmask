@@ -101,19 +101,18 @@ def hamming(a, b):
     return sum(x != y for x, y in zip(a, b))
 
 
-def find_plateaus(results, threshold=5):
+def find_plateaus(results, threshold=5, weighted=True):
     """
     根据解码序列的相似性划分平台期（模糊聚类）。
     相邻角度汉明距离≤threshold → 同一平台期。
     返回: [(consensus_seq, [angles], length), ...]
     """
-    from collections import Counter
     plateaus = []
     cur_seqs = [results[0][1]]
     cur_angles = [results[0][0]]
     for angle, seq in results[1:]:
         # 与当前平台期的共识序列比较
-        consensus = get_consensus(cur_seqs)
+        consensus = get_consensus(cur_seqs, weighted=weighted)
         if hamming(seq, consensus) <= threshold:
             cur_angles.append(angle)
             cur_seqs.append(seq)
@@ -121,18 +120,38 @@ def find_plateaus(results, threshold=5):
             plateaus.append((consensus, list(cur_angles), len(cur_angles)))
             cur_seqs = [seq]
             cur_angles = [angle]
-    plateaus.append((get_consensus(cur_seqs), list(cur_angles), len(cur_angles)))
+    plateaus.append((get_consensus(cur_seqs, weighted=weighted),
+                     list(cur_angles), len(cur_angles)))
     return plateaus
 
 
-def get_consensus(seqs):
-    """取每个bit位的众数作为共识序列"""
+def get_consensus(seqs, weighted=True):
+    """
+    取每个bit位的众数作为共识序列。
+    weighted=True时，平台期中间位置权重高，边缘权重低。
+    """
     from collections import Counter
     n = len(seqs[0])
+    m = len(seqs)
+
+    # 生成权重：中间高、两边低（三角形权重）
+    if weighted and m > 1:
+        # 位置i的权重 = 1 + 三角形窗，中心为1，两端为0
+        center = (m - 1) / 2.0
+        weights = [1.0 + (1.0 - abs(i - center) / center) for i in range(m)]
+    else:
+        weights = [1.0] * m
+
     bits = []
-    for i in range(n):
-        cnt = Counter(s[i] for s in seqs)
-        bits.append(cnt.most_common(1)[0][0])
+    for bit_pos in range(n):
+        score_0 = 0.0
+        score_1 = 0.0
+        for seq_idx, seq in enumerate(seqs):
+            if seq[bit_pos] == '0':
+                score_0 += weights[seq_idx]
+            else:
+                score_1 += weights[seq_idx]
+        bits.append('1' if score_1 >= score_0 else '0')
     return "".join(bits)
 
 
@@ -150,6 +169,8 @@ if __name__ == "__main__":
     ap.add_argument("--angle-step", type=float, default=0.2)
     ap.add_argument("--threshold", type=int, default=5,
                     help="汉明距离阈值，≤此值视为同一平台期（默认5）")
+    ap.add_argument("--no-weighted", action="store_true",
+                    help="不使用加权投票（默认使用三角形加权）")
     ap.add_argument("--show-all", action="store_true",
                     help="显示所有角度的解码结果")
     args = ap.parse_args()
@@ -221,8 +242,10 @@ if __name__ == "__main__":
                 print(f"{angle:+6.1f}°  {acc_str}  {seq}")
 
         # 找平台期（模糊聚类）
+        use_weighted = not args.no_weighted
         plateaus = find_plateaus([(a, s) for a, s, _ in results],
-                                threshold=args.threshold)
+                                threshold=args.threshold,
+                                weighted=use_weighted)
 
         # 计算每个平台期的准确率
         plateaus_with_acc = []
