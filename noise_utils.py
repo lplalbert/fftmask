@@ -715,7 +715,7 @@ def add_perspective_noise(image, d_range=(0, 0.2)):
     return cv2.warpPerspective(image, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
 
-def add_tile_rotate_crop_noise(image, angle_range=(-180, 180), crop_scale_range=None):
+def add_tile_rotate_crop_noise(image, angle_range=(-180, 180), crop_scale_range=None, max_shift=0.5):
     """
     模拟循环平移+旋转噪声：将图像拼成3x3大图，随机旋转后从中间裁剪。
 
@@ -728,6 +728,8 @@ def add_tile_rotate_crop_noise(image, angle_range=(-180, 180), crop_scale_range=
         angle_range: 旋转角度范围（度），默认 (-180, 180)
         crop_scale_range: 裁剪尺寸浮动范围，默认 None (不浮动)
                          例如 (0.9, 1.1) 表示裁剪边长为原尺寸的 0.9~1.1 倍
+        max_shift: 最大循环平移比例 (0-1)，默认 0.5 表示最大平移原图的一半
+                   0 表示不平移，1 表示最大平移一个完整周期
 
     Returns:
         裁剪后的图像，尺寸与输入相同
@@ -759,10 +761,10 @@ def add_tile_rotate_crop_noise(image, angle_range=(-180, 180), crop_scale_range=
         crop_h = h
         crop_w = w
 
-    # 4. 从中心区域随机偏移裁剪（偏移范围限制在±0.5个原始尺寸内，保证裁剪区域完全在3x3图内）
+    # 4. 从中心区域随机偏移裁剪（偏移范围限制在±max_shift个原始尺寸内，保证裁剪区域完全在3x3图内）
     # 确保裁剪区域不超出3x3图边界
-    max_offset_x = min(w // 2, (3 * w - crop_w) // 2 - 1)
-    max_offset_y = min(h // 2, (3 * h - crop_h) // 2 - 1)
+    max_offset_x = min(int(w * max_shift), (3 * w - crop_w) // 2 - 1)
+    max_offset_y = min(int(h * max_shift), (3 * h - crop_h) // 2 - 1)
 
     crop_cx = w + np.random.randint(-max_offset_x, max_offset_x + 1)
     crop_cy = h + np.random.randint(-max_offset_y, max_offset_y + 1)

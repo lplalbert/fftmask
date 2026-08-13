@@ -1,0 +1,52 @@
+# v17 Finetune 配置 - 纯循环平移（无旋转）
+# 50% 无噪声 + 50% pair噪声（包含tile_crop循环平移）
+
+# 路径
+train_dir: /mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train
+val_dir: /mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val
+output_dir: /mnt/lpl/fftmask/output/v17_finetune_shift_only
+
+# 模型加载
+weight_path: /mnt/lpl/fftmask/output/v17_continue/stage2_best.pth
+v17_mode: true
+
+# 水印参数
+block_size: 512
+num_bits: 60
+bits_per_ring: [20, 40]
+ring_positions: [8, 15]
+
+# 训练参数
+epochs: 30
+batch_size: 6
+lr: 0.00002
+gamma: 0.95
+save_every: 1
+val_every: 1
+keep_images: false
+
+# 混合噪声配置
+# 50% 无噪声 + 50% pair噪声
+noise:
+  type: mixed
+  configs:
+    - type: none
+      weight: 0.5
+    - type: pair
+      weight: 0.5
+
+val_noise: pair
+
+# 噪声参数
+# max_rotation=0 表示不旋转
+# max_shift=0.5 表示最大循环平移原图的一半
+max_rotation: 0
+max_shift: 0.5
+
+# 数据增强
+train_length: 0
+val_length: 0
+
+# 显示参数
+disp_min: 0.5
+disp_max: 0.6

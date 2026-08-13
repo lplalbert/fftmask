@@ -1,0 +1,41 @@
+# ── v17: 3环无旋转环 (间隔=5) ──
+version: "v17"
+description: "v17 - 3环无旋转环: 间隔=5, 所有环都嵌入bit"
+
+# ── 数据集 ──
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+train_length: 5120
+val_length: 512
+
+# ── 微调配置 ──
+finetune:
+  weight_path: "/mnt/lpl/fftmask/weights/best_cb_decoder_v14.pth"
+  epochs: 50
+  lr: 0.00005
+
+# ── 噪声配置 ──
+noise_config:
+  train_noise:
+    - type: "pair"
+      weight: 1.0
+  val_noise: "pair"
+
+# ── 输出目录 ──
+output_dir: "/mnt/lpl/fftmask/output/v17"
+
+# ── 模型配置 ──
+block_size: 512
+bits_per_ring: [20, 20, 20]  # 3个水印环，各20bit，共60bit
+ring_positions: [8, 13, 18]  # 3环，间隔=5
+angle_bins: 200
+radius_bins: 12
+
+# ── 噪声和旋转 (固定) ──
+alpha: 0.016
+max_rotation: 5.0
+
+# ── 训练参数 ──
+batch_size: 32
+device: "0"
+lambda_bit: 15.0

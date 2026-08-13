@@ -19,11 +19,11 @@ class WatermarkDatasetV11(Dataset):
     """
     def __init__(self, image_dir, block_size=512, num_bits=60,
                  r_watermark=[12, 25], bitsf=[15, 45],
-                 r_rotation=18, rotation_cycles=8,
+                 r_rotation=18,
                  alpha_embed=0.016, transform=None,
                  noise_level='none', noise_pool=None,
                  max_angle=360, crop_scale_range=None,
-                 max_rotation=5.0,
+                 max_rotation=5.0, max_shift=0.5,
                  max_images=0):
         """
         Args:
@@ -33,7 +33,7 @@ class WatermarkDatasetV11(Dataset):
             r_watermark: 水印环半径
             bitsf: 每个环的位数
             r_rotation: 旋转矫正环半径
-            rotation_cycles: 旋转矫正环周期数
+            r_range: 环宽度
             alpha_embed: 嵌入强度
             transform: 数据变换
             noise_level: 噪声级别
@@ -41,6 +41,7 @@ class WatermarkDatasetV11(Dataset):
             max_angle: 最大旋转角度
             crop_scale_range: 裁剪缩放范围
             max_rotation: 最大旋转角度 (度，用于tile_crop噪声)
+            max_shift: 最大循环平移比例 (0-1)，用于tile_crop噪声
             max_images: 最大图像数
         """
         self.image_dir = image_dir
@@ -53,6 +54,7 @@ class WatermarkDatasetV11(Dataset):
         self.max_angle = max_angle
         self.crop_scale_range = crop_scale_range
         self.max_rotation = max_rotation
+        self.max_shift = max_shift
         self.force_noise_pair = None  # 设为 (type1, type2) 可强制指定噪声组合
 
         # 水印生成器
@@ -62,7 +64,6 @@ class WatermarkDatasetV11(Dataset):
             r_watermark=r_watermark,
             bitsf=bitsf,
             r_rotation=r_rotation,
-            rotation_cycles=rotation_cycles,
             r_range=1,
             n_sectors=num_bits
         )
@@ -103,7 +104,7 @@ class WatermarkDatasetV11(Dataset):
         }
 
         # 验证噪声强度参数
-        valid_levels = list(self.noise_config.keys()) + ['pair', 'fixed_triple']
+        valid_levels = list(self.noise_config.keys()) + ['pair', 'fixed_triple', 'shift_only']
         if self.noise_level not in valid_levels:
             raise ValueError(f"noise_level must be one of: {valid_levels}")
 
@@ -185,6 +186,13 @@ class WatermarkDatasetV11(Dataset):
                 angle_range=(-self.max_angle, self.max_angle),
                 crop_scale_range=self.crop_scale_range
             )
+        elif self.noise_level == 'shift_only':
+            # 仅循环平移，不加旋转
+            watermarked_image = add_tile_rotate_crop_noise(
+                watermarked_image,
+                angle_range=(0, 0),
+                max_shift=self.max_shift
+            )
         elif self.noise_level == 'pair':
             # 两两配对噪声：从 identity/wechat/tile_crop/pimog 中随机选两种不同的依次应用
             if self.force_noise_pair is not None:
@@ -204,7 +212,8 @@ class WatermarkDatasetV11(Dataset):
                     # 3x3拼接 + 旋转 + 裁剪 (循环平移+旋转 combined)
                     watermarked_image = add_tile_rotate_crop_noise(
                         watermarked_image,
-                        angle_range=(-self.max_rotation, self.max_rotation)
+                        angle_range=(-self.max_rotation, self.max_rotation),
+                        max_shift=self.max_shift
                     )
                 elif noise_type == 'pimog':
                     watermarked_image = add_pimog_noise(watermarked_image)
@@ -212,7 +221,8 @@ class WatermarkDatasetV11(Dataset):
             # 固定三重噪声: tile_crop → pimog → wechat
             watermarked_image = add_tile_rotate_crop_noise(
                 watermarked_image,
-                angle_range=(-self.max_rotation, self.max_rotation)
+                angle_range=(-self.max_rotation, self.max_rotation),
+                max_shift=self.max_shift
             )
             watermarked_image = add_pimog_noise(watermarked_image)
             watermarked_image = add_wechat_noise(watermarked_image)

@@ -1,0 +1,38 @@
+# v17 无噪声训练 10轮 - 2环配置
+
+# 路径
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+output_dir: "/mnt/lpl/fftmask/output/v17_r12_25_shift_10ep"
+
+# 微调配置
+finetune:
+  weight_path: "/mnt/lpl/fftmask/weights/stage2_best.pth"
+  epochs: 10
+  lr: 0.00002
+
+# 仅循环平移，不加旋转
+noise_config:
+  train_noise:
+    - type: "shift_only"
+      weight: 1.0
+  val_noise: "none"
+
+# 水印参数 - 2环
+block_size: 512
+bits_per_ring: [20, 40]
+ring_positions: [12, 25]
+angle_bins: 200
+radius_bins: 12
+
+# 噪声和旋转
+alpha: 0.016
+max_rotation: 0
+max_shift: 0.5
+
+# 训练参数
+batch_size: 32
+device: "2"
+lambda_bit: 15.0
+train_length: 0
+val_length: 0

@@ -1,0 +1,46 @@
+# ── v17 微调：添加无噪声训练 ──
+version: "v17"
+description: "v17 微调 - 添加无噪声模式，提升干净图像解码准确率"
+
+# ── 数据集 ──
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+train_length: 5120
+val_length: 512
+
+# ── 微调配置 ──
+finetune:
+  # 从v17最佳权重继续训练
+  weight_path: "/mnt/lpl/fftmask/output/v17_continue/stage2_best.pth"
+  epochs: 30
+  lr: 0.00002  # 较小的学习率用于微调
+
+# ── 噪声配置：无噪声 + pair 并列 ──
+noise_config:
+  # 训练时随机选择噪声模式
+  train_noise:
+    - type: "none"
+      weight: 0.5  # 50%概率无噪声
+    - type: "pair"
+      weight: 0.5  # 50%概率pair噪声
+
+  # 验证时使用pair噪声（测试鲁棒性）
+  val_noise: "pair"
+
+# ── 输出目录 ──
+output_dir: "/mnt/lpl/fftmask/output/v17_finetune_no_noise"
+
+# ── 模型配置 ──
+block_size: 512
+bits_per_ring: [20, 40]  # 2个水印环，20bit+40bit=60bit
+ring_positions: [8, 15]
+angle_bins: 200
+radius_bins: 12
+
+# ── 嵌入参数 ──
+alpha: 0.016
+
+# ── 训练参数 ──
+batch_size: 32
+device: "0"
+lambda_bit: 15.0

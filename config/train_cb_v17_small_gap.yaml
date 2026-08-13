@@ -1,0 +1,48 @@
+# ── v17: 2环无旋转环，小间隔搜索 ──
+version: "v17"
+description: "v17 - 2环无旋转环: 测试不同间隔配置"
+
+# ── 数据集 ──
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+train_length: 5120
+val_length: 512
+
+# ── 阶段2: 间隔搜索 ──
+stage2:
+  epochs_per_position: 30
+  lr: 0.00005
+  # 固定ring0=8，测试不同间隔
+  # 嵌入范围: [r, r+1] (ring_width=2)
+  # 采样范围: Ring0=[r0-2, r1-1], Ring1=[r0+2, r1+10]
+  # 采样范围重叠是设计意图，有助于模型学习
+  search_grid:
+    positions:
+      - [8, 20]  # 间隔=12
+      - [8, 18]  # 间隔=10
+      - [8, 16]  # 间隔=8
+      - [8, 15]  # 间隔=7
+      - [8, 14]  # 间隔=6
+      - [8, 13]  # 间隔=5
+      - [8, 12]  # 间隔=4
+  top_k: 3
+
+# ── 输出目录 ──
+output_dir: "/mnt/lpl/fftmask/output/v17_small_gap"
+weight_path: "/mnt/lpl/fftmask/weights/best_cb_decoder_v14.pth"
+
+# ── 模型配置 ──
+block_size: 512
+bits_per_ring: [20, 40]  # 2个水印环，20bit+40bit=60bit
+angle_bins: 200
+radius_bins: 12
+
+# ── 噪声和旋转 (固定) ──
+alpha: 0.016
+noise_level: "pair"
+max_rotation: 5.0
+
+# ── 训练参数 ──
+batch_size: 32
+device: "0"
+lambda_bit: 15.0

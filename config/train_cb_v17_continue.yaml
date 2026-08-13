@@ -1,0 +1,40 @@
+# ── v17: 继续训练 [8,13] 和 [8,15] ──
+version: "v17"
+description: "v17 - 从最佳权重继续训练 [8,13] 和 [8,15]"
+
+# ── 数据集 ──
+train_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train"
+val_dir: "/mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val"
+train_length: 5120
+val_length: 512
+
+# ── 阶段2: 继续训练 ──
+stage2:
+  epochs_per_position: 50  # 增加到50轮
+  lr: 0.00005
+  search_grid:
+    positions:
+      - [8, 13]  # 间隔=5
+      - [8, 15]  # 间隔=7
+  top_k: 2
+
+# ── 输出目录 ──
+output_dir: "/mnt/lpl/fftmask/output/v17_continue"
+# 使用v17最佳权重继续训练（[8,18] 79.6%）
+weight_path: "/mnt/lpl/fftmask/output/v17_small_gap/stage2_best_2.pth"
+
+# ── 模型配置 ──
+block_size: 512
+bits_per_ring: [20, 40]  # 2个水印环，20bit+40bit=60bit
+angle_bins: 200
+radius_bins: 12
+
+# ── 噪声和旋转 (固定) ──
+alpha: 0.016
+noise_level: "pair"
+max_rotation: 5.0
+
+# ── 训练参数 ──
+batch_size: 32
+device: "0"
+lambda_bit: 15.0
