@@ -1,0 +1,47 @@
+# v18 镂空模板微调训练
+# hollow_ratio=0.3, alpha=0.0287 (等效不镂空alpha=0.024的PSNR)
+
+# 路径
+train_dir: "/data/xsj/dataset/coco/train"
+val_dir: "/data/xsj/dataset/coco/val"
+output_dir: "/home/lpl2025/lpl/fftmask/output/v18_hollow"
+
+# 微调配置
+finetune:
+  weight_path: "/home/lpl2025/lpl/fftmask/best_cb_decoder.pth"
+  epochs: 100
+  lr: 0.00002
+
+# 水印参数
+block_size: 512
+num_bits: 60
+bits_per_ring: [15, 45]
+ring_positions: [12, 25]
+angle_bins: 180
+
+# 镂空模板参数
+M_w: 255
+M_b: 0
+hollow_ratio: 0.3
+
+# 嵌入强度 (等效不镂空alpha=0.016的PSNR)
+alpha: 0.0191
+
+# 噪声配置
+noise_config:
+  train_noise:
+    - type: "none"
+      weight: 0.5
+    - type: "pair"
+      weight: 0.5
+  val_noise: "none"
+
+# 噪声参数
+max_rotation: 0
+max_shift: 0.5
+
+# 训练参数
+batch_size: 32
+lambda_bit: 15.0
+train_length: 10240
+val_length: 1024

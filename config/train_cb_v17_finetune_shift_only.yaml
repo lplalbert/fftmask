@@ -2,12 +2,12 @@
 # 50% 无噪声 + 50% pair噪声（包含tile_crop循环平移）
 
 # 路径
-train_dir: /mnt/xsj2023/Datasets/COCO/coco_minator_dataset/train
-val_dir: /mnt/xsj2023/Datasets/COCO/coco_minator_dataset/val
-output_dir: /mnt/lpl/fftmask/output/v17_finetune_shift_only
+train_dir: /data/xsj/dataset/coco/train
+val_dir: /data/xsj/dataset/coco/val
+output_dir: /home/lpl2025/lpl/fftmask/output/v17_finetune_shift_only
 
 # 模型加载
-weight_path: /mnt/lpl/fftmask/output/v17_continue/stage2_best.pth
+weight_path: /home/lpl2025/lpl/fftmask/weights/stage2_best.pth
 v17_mode: true
 
 # 水印参数

@@ -23,7 +23,7 @@ from tqdm import tqdm
 import yaml
 
 from watermark_decoder_v17 import WatermarkDecoderV17
-from dataset_v17 import WatermarkDatasetV17 as WatermarkDatasetV11
+from dataset_v18 import WatermarkDatasetV18 as WatermarkDatasetV11
 
 # 设置日志
 logging.basicConfig(
@@ -81,7 +81,7 @@ class MixedNoiseDataset(Dataset):
 
 def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                   ring_positions=None, bits_per_ring=None):
-    """构建训练数据集"""
+    """构建训练数据集 (v18 镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
@@ -98,14 +98,17 @@ def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('train_length', 0)
+        max_images=cfg.get('train_length', 0),
+        M_w=cfg.get('M_w', 200),
+        M_b=cfg.get('M_b', 55),
+        hollow_ratio=cfg.get('hollow_ratio', 0.3)
     )
     return dataset
 
 
 def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                       ring_positions=None, bits_per_ring=None):
-    """构建验证数据集"""
+    """构建验证数据集 (v18 镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
@@ -122,7 +125,10 @@ def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('val_length', 0)
+        max_images=cfg.get('val_length', 0),
+        M_w=cfg.get('M_w', 200),
+        M_b=cfg.get('M_b', 55),
+        hollow_ratio=cfg.get('hollow_ratio', 0.3)
     )
     return dataset
 
@@ -173,7 +179,7 @@ def validate(model, val_loader, device, num_bits, bits_per_ring=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='v17 微调训练')
+    parser = argparse.ArgumentParser(description='v18 镂空水印训练')
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
     parser.add_argument('--device', type=str, default=None, help='GPU编号(覆盖config)')
     args = parser.parse_args()
@@ -226,17 +232,27 @@ def main():
     train_noise_configs = noise_config.get('train_noise', [{'type': 'none', 'weight': 1.0}])
     val_noise = noise_config.get('val_noise', 'none')
 
+    # 镂空参数
+    M_w = cfg.get('M_w', 200)
+    M_b = cfg.get('M_b', 55)
+    hollow_ratio = cfg.get('hollow_ratio', 0.0)
+
     logger.info(f"圆环位置: {ring_positions}")
     logger.info(f"Bits配置: {bits_per_ring} (共{num_bits}bit)")
+    logger.info(f"镂空参数: M_w={M_w}, M_b={M_b}, hollow_ratio={hollow_ratio}")
+    logger.info(f"嵌入强度: alpha={alpha}")
     logger.info(f"训练噪声配置: {train_noise_configs}")
     logger.info(f"验证噪声: {val_noise}")
     logger.info(f"学习率: {lr}")
     logger.info(f"训练轮数: {epochs}")
 
     # 创建模型
+    angle_bins = cfg.get('angle_bins', 200)
     model = WatermarkDecoderV17(
         n_sectors=num_bits,
         bits=bits_per_ring,
+        angle_bins=angle_bins,
+        radius_bins=12,
         ring_positions_init=[float(r) for r in ring_positions]
     )
 
@@ -247,6 +263,10 @@ def main():
         if isinstance(state_dict, dict) and 'model' in state_dict:
             state_dict = state_dict['model']
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # 移除ring_positions，保留模型初始化时的值
+        if 'ring_positions' in state_dict:
+            del state_dict['ring_positions']
 
         # 检测v14格式并重映射
         is_v14_format = any(k.startswith('ring_transformers.2.') for k in state_dict.keys())

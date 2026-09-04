@@ -1,10 +1,10 @@
 """
-v17 微调训练脚本 - 添加无噪声训练
+v18 镂空水印训练 - 纯pair噪声版
 
-支持混合噪声模式：无噪声和pair噪声并列使用
+支持每N轮保存一次权重，纯pair噪声训练
 
 用法:
-    python train_cb_v17_finetune.py --config config/train_cb_v17_finetune_no_noise.yaml
+    python train_cb_v18_pair.py --config config/train_cb_v18_hollow_pair.yaml
 """
 
 import os
@@ -21,9 +21,10 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 import yaml
+import json
 
 from watermark_decoder_v17 import WatermarkDecoderV17
-from dataset_v17 import WatermarkDatasetV17 as WatermarkDatasetV11
+from dataset_v18 import WatermarkDatasetV18 as WatermarkDatasetV11
 
 # 设置日志
 logging.basicConfig(
@@ -31,7 +32,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('train.log')
+        logging.FileHandler('train_cb_v18_pair.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -40,16 +41,9 @@ logger = logging.getLogger(__name__)
 class MixedNoiseDataset(Dataset):
     """
     支持混合噪声的数据集
-
-    可以配置不同噪声模式的概率分布
     """
 
     def __init__(self, base_dataset, noise_configs):
-        """
-        Args:
-            base_dataset: 基础数据集
-            noise_configs: 噪声配置列表 [{'type': 'none', 'weight': 0.5}, {'type': 'pair', 'weight': 0.5}]
-        """
         self.base_dataset = base_dataset
         self.noise_configs = noise_configs
         self.weights = [c['weight'] for c in noise_configs]
@@ -81,7 +75,7 @@ class MixedNoiseDataset(Dataset):
 
 def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                   ring_positions=None, bits_per_ring=None):
-    """构建训练数据集"""
+    """构建训练数据集 (v18 镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
@@ -98,14 +92,17 @@ def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('train_length', 0)
+        max_images=cfg.get('train_length', 0),
+        M_w=cfg.get('M_w', 200),
+        M_b=cfg.get('M_b', 55),
+        hollow_ratio=cfg.get('hollow_ratio', 0.3)
     )
     return dataset
 
 
 def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                       ring_positions=None, bits_per_ring=None):
-    """构建验证数据集"""
+    """构建验证数据集 (v18 镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
@@ -122,7 +119,10 @@ def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('val_length', 0)
+        max_images=cfg.get('val_length', 0),
+        M_w=cfg.get('M_w', 200),
+        M_b=cfg.get('M_b', 55),
+        hollow_ratio=cfg.get('hollow_ratio', 0.3)
     )
     return dataset
 
@@ -173,7 +173,7 @@ def validate(model, val_loader, device, num_bits, bits_per_ring=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='v17 微调训练')
+    parser = argparse.ArgumentParser(description='v18 镂空水印训练 - 纯pair噪声')
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
     parser.add_argument('--device', type=str, default=None, help='GPU编号(覆盖config)')
     args = parser.parse_args()
@@ -186,7 +186,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 创建输出目录
-    output_dir = cfg.get('output_dir', f'output/v17_finetune_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    output_dir = cfg.get('output_dir', f'output/v18_pair_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     os.makedirs(output_dir, exist_ok=True)
 
     # 保存配置
@@ -194,7 +194,7 @@ def main():
         yaml.dump(cfg, f, allow_unicode=True)
 
     logger.info("=" * 60)
-    logger.info("v17 微调训练 - 混合噪声模式")
+    logger.info("v18 镂空水印训练 - 纯pair噪声")
     logger.info("=" * 60)
     logger.info(f"配置文件: {args.config}")
     logger.info(f"输出目录: {output_dir}")
@@ -214,6 +214,7 @@ def main():
     num_bits = sum(bits_per_ring)
     batch_size = cfg.get('batch_size', 32)
     lambda_bit = cfg.get('lambda_bit', 15.0)
+    save_every = cfg.get('save_every', 10)  # 每N轮保存一次
 
     # 微调参数
     finetune_cfg = cfg.get('finetune', {})
@@ -226,17 +227,28 @@ def main():
     train_noise_configs = noise_config.get('train_noise', [{'type': 'none', 'weight': 1.0}])
     val_noise = noise_config.get('val_noise', 'none')
 
+    # 镂空参数
+    M_w = cfg.get('M_w', 200)
+    M_b = cfg.get('M_b', 55)
+    hollow_ratio = cfg.get('hollow_ratio', 0.0)
+
     logger.info(f"圆环位置: {ring_positions}")
     logger.info(f"Bits配置: {bits_per_ring} (共{num_bits}bit)")
+    logger.info(f"镂空参数: M_w={M_w}, M_b={M_b}, hollow_ratio={hollow_ratio}")
+    logger.info(f"嵌入强度: alpha={alpha}")
     logger.info(f"训练噪声配置: {train_noise_configs}")
     logger.info(f"验证噪声: {val_noise}")
     logger.info(f"学习率: {lr}")
     logger.info(f"训练轮数: {epochs}")
+    logger.info(f"保存间隔: 每{save_every}轮")
 
     # 创建模型
+    angle_bins = cfg.get('angle_bins', 200)
     model = WatermarkDecoderV17(
         n_sectors=num_bits,
         bits=bits_per_ring,
+        angle_bins=angle_bins,
+        radius_bins=12,
         ring_positions_init=[float(r) for r in ring_positions]
     )
 
@@ -247,6 +259,10 @@ def main():
         if isinstance(state_dict, dict) and 'model' in state_dict:
             state_dict = state_dict['model']
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # 移除ring_positions，保留模型初始化时的值
+        if 'ring_positions' in state_dict:
+            del state_dict['ring_positions']
 
         # 检测v14格式并重映射
         is_v14_format = any(k.startswith('ring_transformers.2.') for k in state_dict.keys())
@@ -382,6 +398,20 @@ def main():
             }, save_path)
             logger.info(f"  ✓ 保存最佳模型 (val_acc={val_acc*100:.2f}%)")
 
+        # 每N轮保存一次权重
+        if (epoch + 1) % save_every == 0:
+            checkpoint_path = os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth')
+            torch.save({
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'train_acc': train_acc,
+                'best_val_acc': best_val_acc,
+                'best_epoch': best_epoch,
+            }, checkpoint_path)
+            logger.info(f"  ✓ 保存checkpoint: checkpoint_epoch_{epoch+1}.pth")
+
     # 保存最终模型
     final_path = os.path.join(output_dir, 'final_model.pth')
     torch.save({
@@ -408,7 +438,6 @@ def main():
         }
     }
 
-    import json
     with open(os.path.join(output_dir, 'results.json'), 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 

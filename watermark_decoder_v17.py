@@ -232,23 +232,14 @@ class WatermarkDecoderV17(nn.Module):
 
         # 计算采样范围
         # 嵌入范围: [r, r+r_range] (r_range=1, 由编码器决定)
-        # 采样范围: Ring0=[r0-2, r1-3], Ring1=[r0+ring_width+2, r1+3]
+        # 采样范围: 以嵌入半径为中心，宽度为 sampling_half_width
+        sampling_half_width = 5
         num_rings = len(ring_pos)
         dynamic_rings = []
         for i in range(num_rings):
             r = ring_pos[i]
-            if i == 0:
-                # 第一个环：采样范围 [r-2, ring1-3]
-                min_r = r - 2
-                max_r = ring_pos[i+1] - 3
-            elif i == num_rings - 1:
-                # 最后一个环：采样范围 [ring0+ring_width+2, r+3]
-                min_r = ring_pos[i-1] + self.ring_width + 2
-                max_r = r + 3
-            else:
-                # 中间环：采样范围 [前一个环嵌入结束+2, 下一个环嵌入开始-3]
-                min_r = ring_pos[i-1] + self.ring_width + 2
-                max_r = ring_pos[i+1] - 3
+            min_r = r - sampling_half_width
+            max_r = r + sampling_half_width
             dynamic_rings.append((min_r, max_r))
 
         # 解码所有环

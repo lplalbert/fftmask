@@ -1,0 +1,38 @@
+# ── v18: 4环无旋转环 (间隔=5) ──
+version: "v18"
+description: "v18 - 4环无旋转环: 间隔=5, 所有环都嵌入bit"
+
+# ── 数据集 ──
+train_dir: "/data/xsj/dataset/coco/mini_coco/train"
+val_dir: "/data/xsj/dataset/coco/mini_coco/val"
+train_length: 5120
+val_length: 512
+
+# ── 阶段2: 网格搜索 ──
+stage2:
+  epochs_per_position: 50
+  lr: 0.00005
+  search_grid:
+    positions:
+      - [8, 13, 18, 23]  # 4环，间隔=5
+  top_k: 1
+
+# ── 输出目录 ──
+output_dir: "/home/lpl2025/lpl/fftmask/output/v18_4rings"
+weight_path: "/home/lpl2025/lpl/fftmask/output/v14/20260731_164252/models/best_cb_decoder_v14.pth"
+
+# ── 模型配置 ──
+block_size: 512
+bits_per_ring: [20, 20, 20, 20]  # 4个水印环，各20bit，共80bit
+angle_bins: 200
+radius_bins: 12
+
+# ── 噪声和旋转 (固定) ──
+alpha: 0.016
+noise_level: "pair"
+max_rotation: 5.0
+
+# ── 训练参数 ──
+batch_size: 32
+device: "1"
+lambda_bit: 15.0
