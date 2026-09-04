@@ -1,0 +1,40 @@
+# v17 无镂空水印训练 - 纯pair噪声（与v18_hollow_pair对比用）
+train_dir: "/data/xsj/dataset/coco/train"
+val_dir: "/data/xsj/dataset/coco/val"
+output_dir: "output/v17_pair"
+
+# 预训练权重
+finetune:
+  weight_path: "/home/lpl2025/lpl/fftmask/best_cb_decoder.pth"
+  epochs: 100
+  lr: 0.00002
+
+# 模型参数（与v18一致）
+block_size: 512
+num_bits: 60
+bits_per_ring: [15, 45]
+ring_positions: [12, 25]
+angle_bins: 180
+
+# 嵌入参数（无镂空，纯二值模板）
+alpha: 0.0191
+
+# 噪声配置 - 纯pair噪声
+noise_config:
+  train_noise:
+    - type: "pair"
+      weight: 1.0
+  val_noise: "none"
+
+# 数据增强
+max_rotation: 0
+max_shift: 0.5
+
+# 训练参数
+batch_size: 32
+lambda_bit: 15.0
+train_length: 10240
+val_length: 1024
+
+# 保存配置
+save_every: 10
