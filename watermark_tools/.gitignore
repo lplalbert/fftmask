@@ -1,0 +1,12 @@
+# Generated templates (large binary files)
+generated_templates/
+preview_output/
+clean_image/
+__pycache__/
+*.pyc
+
+# Output directories
+sorted/
+
+# Playlists
+playlist*.json

@@ -12,3 +12,5 @@ output_noise
 img_encode
 tmp
 __pycache__
+.claude/
+watermark_tools.zip
