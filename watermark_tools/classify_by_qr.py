@@ -32,31 +32,41 @@ import cv2
 
 def decode_qr(image):
     """从图片中解码二维码，返回解码结果列表（使用OpenCV内置检测器）"""
+    import numpy as np
     detector = cv2.QRCodeDetector()
-    decoded = []
 
-    # 尝试检测多个二维码
-    retval, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
-    if retval and decoded_info:
-        for i, data in enumerate(decoded_info):
-            if data:
-                decoded.append({
-                    "data": data,
-                    "type": "QRCODE",
-                    "rect": None,
-                })
+    # 多种预处理方式
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
 
-    # 多二维码检测失败，尝试单个
-    if not decoded:
-        data, points, _ = detector.detectAndDecode(image)
-        if data:
-            decoded.append({
-                "data": data,
-                "type": "QRCODE",
-                "rect": None,
-            })
+    candidates = [
+        image,
+        gray,
+        cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1],
+        cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)[1],
+        cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        cv2.GaussianBlur(gray, (5, 5), 0),
+    ]
 
-    return decoded
+    for processed in candidates:
+        # 尝试多二维码检测
+        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(processed)
+        if retval and decoded_info:
+            decoded = []
+            for data in decoded_info:
+                if data and '|' in data:
+                    decoded.append({"data": data, "type": "QRCODE", "rect": None})
+            if decoded:
+                return decoded
+
+        # 尝试单个检测
+        data, points, _ = detector.detectAndDecode(processed)
+        if data and '|' in data:
+            return [{"data": data, "type": "QRCODE", "rect": None}]
+
+    return []
 
 
 def parse_qr_data(data):

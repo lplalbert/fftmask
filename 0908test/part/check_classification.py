@@ -25,22 +25,31 @@ def decode_qr(image_path):
 
     for x1, y1, x2, y2 in regions:
         crop = img[y1:y2, x1:x2]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-        # 多种预处理
-        candidates = [
-            crop,
-            gray,
-            cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1],
-            cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)[1],
-            cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-            cv2.GaussianBlur(gray, (5, 5), 0),
-        ]
+        # 尝试不同尺度（小图需要放大）
+        for scale in [1.0, 1.5, 2.0, 0.5]:
+            if scale != 1.0:
+                interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+                scaled = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interp)
+            else:
+                scaled = crop
 
-        for processed in candidates:
-            d, _, _ = detector.detectAndDecode(processed)
-            if d and '|' in d:
-                return d
+            gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+
+            # 多种预处理
+            candidates = [
+                scaled,
+                gray,
+                cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1],
+                cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)[1],
+                cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+                cv2.GaussianBlur(gray, (5, 5), 0),
+            ]
+
+            for processed in candidates:
+                d, _, _ = detector.detectAndDecode(processed)
+                if d and '|' in d:
+                    return d
 
     return None
 
@@ -59,7 +68,11 @@ def parse_qr_data(data):
 
 
 def main():
-    base_dir = Path(r"C:\Users\24976\Desktop\code\fftmask\0908test\part\pz")
+    import sys
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1])
+    else:
+        base_dir = Path(r"C:\Users\24976\Desktop\code\fftmask\0908test\part\pz")
     results = []
     contradictions = []
 
