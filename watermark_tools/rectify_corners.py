@@ -108,12 +108,15 @@ def filter_by_size(markers, tolerance=0.3):
 
 def select_corner_markers(markers, image_w, image_h, size_tolerance=0.3):
     """
-    选取4个大小相似的标记作为角标。
+    选取4个大小相似的标记作为角标，确保形成合理的矩形。
 
     策略：
-    1. 按大小聚类，找出最相似的一组标记（排除二维码中的小回字形）
-    2. 直接使用这4个标记作为角点（按位置排序：左上、右上、左下、右下）
+    1. 按大小聚类，找出最相似的一组标记
+    2. 从所有4点组合中，选最接近矩形的一组
+    3. 用凸包+面积最大化来选取最优4点
     """
+    from itertools import combinations
+
     if len(markers) < 4:
         raise RuntimeError(f"检测到 {len(markers)} 个标记，不足4个，无法矫正")
 
@@ -122,14 +125,77 @@ def select_corner_markers(markers, image_w, image_h, size_tolerance=0.3):
     if len(filtered) < 4:
         raise RuntimeError(f"大小筛选后只剩 {len(filtered)} 个标记，不足4个")
 
-    # 按位置排序：左上、右上、左下、右下
-    # 先按y坐标分上下两组，再按x坐标分左右
-    sorted_by_y = sorted(filtered, key=lambda m: m["center"][1])
-    top_two = sorted(sorted_by_y[:2], key=lambda m: m["center"][0])
-    bottom_two = sorted(sorted_by_y[2:], key=lambda m: m["center"][0])
+    if len(filtered) == 4:
+        # 刚好4个，直接用
+        points = np.array([m["center"] for m in filtered], dtype="float32")
+        return _order_rect(points, filtered)
 
-    selected = [top_two[0], top_two[1], bottom_two[0], bottom_two[1]]
-    return selected
+    # 多于4个，选最接近矩形的组合
+    best_score = -1
+    best_combo = None
+
+    for combo in combinations(range(len(filtered)), 4):
+        pts = np.array([filtered[i]["center"] for i in combo], dtype="float32")
+        score = _rect_score(pts)
+        if score > best_score:
+            best_score = score
+            best_combo = combo
+
+    selected = [filtered[i] for i in best_combo]
+    points = np.array([m["center"] for m in selected], dtype="float32")
+    return _order_rect(points, selected)
+
+
+def _rect_score(pts):
+    """评估4个点接近矩形的程度（0~1，越大越接近矩形）"""
+    # 计算凸包面积与外接矩形面积的比值
+    hull = cv2.convexHull(pts.reshape(-1, 1, 2).astype(np.float32))
+    hull_area = cv2.contourArea(hull)
+
+    # 外接矩形
+    rect = cv2.minAreaRect(hull)
+    rect_area = rect[1][0] * rect[1][1]
+
+    if rect_area < 1:
+        return 0
+
+    # 面积比（接近1说明点在矩形边上）
+    area_ratio = hull_area / rect_area
+
+    # 宽高比（接近1说明接近正方形，可选）
+    w, h = rect[1]
+    aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+
+    # 综合得分
+    return area_ratio * 0.7 + aspect * 0.3
+
+
+def _order_rect(points, markers):
+    """将4个点按左上、右上、右下、左下排序"""
+    # 用minAreaRect获取正确的角点顺序
+    rect = cv2.minAreaRect(points.reshape(-1, 1, 2).astype(np.float32))
+    box = cv2.boxPoints(rect)  # 返回4个角点
+
+    # box的顺序是：左下、右下、右上、左上（按OpenCV惯例）
+    # 我们需要：左上、右上、右下、左下
+    s = box.sum(axis=1)
+    d = np.diff(box, axis=1).flatten()
+
+    ordered = np.zeros((4, 2), dtype="float32")
+    ordered[0] = box[np.argmin(s)]   # 左上
+    ordered[2] = box[np.argmax(s)]   # 右下
+    ordered[1] = box[np.argmin(d)]   # 右上
+    ordered[3] = box[np.argmax(d)]   # 左下
+
+    # 将排序后的点映射回原始markers
+    result = []
+    for target in ordered:
+        # 找最近的原始点
+        dists = [np.linalg.norm(np.array(m["center"]) - target) for m in markers]
+        best_idx = int(np.argmin(dists))
+        result.append(markers[best_idx])
+
+    return result
 
 
 def order_points(pts):
