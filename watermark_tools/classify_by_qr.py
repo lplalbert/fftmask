@@ -149,7 +149,14 @@ def process_single_image(image_path):
         "error": None,
     }
 
-    image = cv2.imread(str(image_path))
+    # 用numpy读取支持中文路径
+    import numpy as np
+    try:
+        with open(str(image_path), 'rb') as f:
+            data = np.frombuffer(f.read(), dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except Exception:
+        image = None
     if image is None:
         result["error"] = "无法读取图片"
         return result
@@ -184,7 +191,7 @@ def classify_single(image_path, output_dir, move=False, dry_run=False):
     info = process_single_image(image_path)
 
     if info["error"]:
-        print(f"  ✗ {Path(image_path).name}: {info['error']}")
+        print(f"  [FAIL] {Path(image_path).name}: {info['error']}")
         return info
 
     # 构建目标路径: output/v17/cb/02/
@@ -196,7 +203,8 @@ def classify_single(image_path, output_dir, move=False, dry_run=False):
 
     dest_path = dest_dir / Path(image_path).name
 
-    print(f"  ✓ {Path(image_path).name} → {info['version']}/{info['channel']}/{info['index']:02d if info['index'] is not None else '?'}")
+    idx_str = f"{info['index']:02d}" if info['index'] is not None else "?"
+    print(f"  [OK] {Path(image_path).name} -> {info['version']}/{info['channel']}/{idx_str}")
 
     if dry_run:
         info["dest"] = str(dest_path)
