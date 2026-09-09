@@ -65,50 +65,70 @@ def detect_all_markers(model, image, conf=0.3, imgsz=2048):
     return markers
 
 
-def select_corner_markers(markers, image_w, image_h):
+def filter_by_size(markers, tolerance=0.3):
     """
-    选取最靠近图片四角的4个标记。
+    按大小筛选：找出大小最相似的一组标记（至少4个）。
 
-    策略：将图片分成4个象限（左上、右上、左下、右下），
-    每个象限选离角落最近的一个标记。
+    策略：对每个标记，计算有多少其他标记和它大小接近（容差内）。
+    选择"邻居最多"的那个标记作为代表，然后收集它所有大小相近的邻居。
+
+    这样可以自动识别角标（通常4个大小相近）并排除二维码中的小回字形。
+    """
+    if len(markers) <= 4:
+        return markers
+
+    # 计算每个标记的平均尺寸
+    avg_sizes = [(m["size"][0] + m["size"][1]) / 2 for m in markers]
+
+    # 对每个标记，找大小相近的邻居数量
+    best_count = 0
+    best_idx = 0
+    for i, si in enumerate(avg_sizes):
+        count = 0
+        for j, sj in enumerate(avg_sizes):
+            if abs(si - sj) / si <= tolerance:
+                count += 1
+        if count > best_count:
+            best_count = count
+            best_idx = i
+
+    # 收集与最佳代表大小相近的标记
+    ref_size = avg_sizes[best_idx]
+    filtered = []
+    for m, avg_size in zip(markers, avg_sizes):
+        if abs(avg_size - ref_size) / ref_size <= tolerance:
+            filtered.append(m)
+
+    # 如果筛选后不足4个，返回全部
+    if len(filtered) < 4:
+        return markers
+
+    return filtered
+
+
+def select_corner_markers(markers, image_w, image_h, size_tolerance=0.3):
+    """
+    选取4个大小相似的标记作为角标。
+
+    策略：
+    1. 按大小聚类，找出最相似的一组标记（排除二维码中的小回字形）
+    2. 直接使用这4个标记作为角点（按位置排序：左上、右上、左下、右下）
     """
     if len(markers) < 4:
         raise RuntimeError(f"检测到 {len(markers)} 个标记，不足4个，无法矫正")
 
-    # 四个角落的目标位置
-    corners = [
-        (0, 0),                # 左上
-        (image_w, 0),          # 右上
-        (0, image_h),          # 左下
-        (image_w, image_h),    # 右下
-    ]
+    # 按大小筛选
+    filtered = filter_by_size(markers, tolerance=size_tolerance)
+    if len(filtered) < 4:
+        raise RuntimeError(f"大小筛选后只剩 {len(filtered)} 个标记，不足4个")
 
-    # 将标记分配到最近的角落
-    # 每个标记计算到4个角落的距离，分配到最近的那个
-    assigned = [[] for _ in range(4)]  # 4个角落各一个列表
+    # 按位置排序：左上、右上、左下、右下
+    # 先按y坐标分上下两组，再按x坐标分左右
+    sorted_by_y = sorted(filtered, key=lambda m: m["center"][1])
+    top_two = sorted(sorted_by_y[:2], key=lambda m: m["center"][0])
+    bottom_two = sorted(sorted_by_y[2:], key=lambda m: m["center"][0])
 
-    for marker in markers:
-        cx, cy = marker["center"]
-        dists = []
-        for corner_x, corner_y in corners:
-            dist = np.sqrt((cx - corner_x) ** 2 + (cy - corner_y) ** 2)
-            dists.append(dist)
-        nearest_corner = int(np.argmin(dists))
-        assigned[nearest_corner].append(marker)
-
-    # 每个角落选最近的一个
-    selected = []
-    for i, (corner_x, corner_y) in enumerate(corners):
-        corner_markers = assigned[i]
-        if not corner_markers:
-            raise RuntimeError(f"角落 {i} 附近没有检测到标记")
-
-        # 选离角落最近的
-        best = min(corner_markers, key=lambda m: np.sqrt(
-            (m["center"][0] - corner_x) ** 2 + (m["center"][1] - corner_y) ** 2
-        ))
-        selected.append(best)
-
+    selected = [top_two[0], top_two[1], bottom_two[0], bottom_two[1]]
     return selected
 
 
@@ -169,8 +189,9 @@ def draw_debug(image, markers, selected, output_path=None):
     for i, m in enumerate(selected):
         cx, cy = int(m["center"][0]), int(m["center"][1])
         cv2.circle(debug, (cx, cy), 15, (0, 0, 255), 3)
-        cv2.putText(debug, labels[i], (cx - 10, cy - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        w, h = m["size"]
+        cv2.putText(debug, f'{labels[i]} {w:.0f}x{h:.0f}', (cx - 10, cy - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     # 画四边形连线
     pts = np.array([list(m["center"]) for m in selected], dtype=np.int32)
@@ -207,6 +228,7 @@ def main():
     parser.add_argument("--local", action="store_true", help="局部模式：只输出768x768区域")
     parser.add_argument("--region_size", type=int, default=768, help="局部模式区域大小")
     parser.add_argument("--debug", action="store_true", help="保存调试图（标记检测结果）")
+    parser.add_argument("--size-tolerance", type=float, default=0.3, help="大小筛选容差，默认0.3")
     args = parser.parse_args()
 
     # 加载模型
@@ -230,14 +252,18 @@ def main():
 
     # 检测所有标记
     markers = detect_all_markers(model, image, conf=args.conf, imgsz=args.imgsz)
-    print(f"检测到 {len(markers)} 个回字形标记")
+    print(f"检测到 {len(markers)} 个回字形标记:")
+    for i, m in enumerate(markers):
+        cx, cy = m["center"]
+        w, h = m["size"]
+        print(f"  [{i}] ({cx:.0f}, {cy:.0f}) size={w:.0f}x{h:.0f} conf={m['conf']:.3f}")
 
     if len(markers) < 4:
         print(f"错误: 标记不足4个，无法矫正")
         sys.exit(1)
 
     # 选四角标记
-    selected = select_corner_markers(markers, w, h)
+    selected = select_corner_markers(markers, w, h, size_tolerance=args.size_tolerance)
     print("选中的四角标记:")
     labels = ["左上", "右上", "左下", "右下"]
     for i, m in enumerate(selected):
