@@ -3,13 +3,13 @@
 """
 四角回字形透视矫正
 
-用YOLO检测所有回字形标记，选取最靠近图片四角的4个做透视变换。
-自动排除信息二维码中的回字形（它不在角落）。
+用YOLO检测所有回字形标记，按大小筛选相似标记，选取最接近矩形的4个做透视变换。
+自动排除信息二维码中的小回字形。
 
 用法:
     python rectify_corners.py --image photo.jpg
     python rectify_corners.py --image photo.jpg --output rectified.jpg --debug
-    python rectify_corners.py --image photo.jpg --screen-w 1920 --screen-h 1080
+    python rectify_corners.py --image photo.jpg --screen-w 668 --screen-h 668
 """
 
 import argparse

@@ -1,4 +1,4 @@
-"""批量矫正：768x768，使用大小筛选，递归处理子目录"""
+"""批量矫正：668x668，使用大小筛选，递归处理子目录"""
 import subprocess
 import sys
 from pathlib import Path
@@ -43,8 +43,8 @@ for src_dir in dirs:
             [sys.executable, str(SCRIPT),
              "--image", str(img),
              "--output", str(out_file),
-             "--screen-w", "768",
-             "--screen-h", "768"],
+             "--screen-w", "668",
+             "--screen-h", "668"],
             capture_output=True, timeout=60
         )
         if result.returncode == 0:

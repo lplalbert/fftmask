@@ -69,6 +69,10 @@ def parse_qr_data(data):
 
 def main():
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+        print("用法: python check_classification.py [目录路径]")
+        print("默认检查 pz 目录")
+        return
     if len(sys.argv) > 1:
         base_dir = Path(sys.argv[1])
     else:
