@@ -1,0 +1,20 @@
+# 图片目录（大文件不上传）
+full/
+full_rectified/
+full_sorted/
+part/pz/
+part/pz_rectified/
+part/pzvx/
+part/pzvx_rectified/
+*_rectified/
+*_sorted/
+
+# 输出文件
+*.jpg
+*.png
+*.bmp
+
+# JSON结果（可选上传）
+# bit_sequences.json
+# classification_check.json
+# rectification_results.json
