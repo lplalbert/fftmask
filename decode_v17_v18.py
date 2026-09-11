@@ -222,6 +222,8 @@ def main():
     parser.add_argument("--coarse_step", type=float, default=5.0, help="粗搜步长")
     parser.add_argument("--hamming_threshold", type=int, default=5,
                         help="平台期汉明距离阈值")
+    parser.add_argument("--no_gt_selection", action="store_true",
+                        help="不用GT选平台期，选最长平台期（实际部署用）")
     args = parser.parse_args()
 
     # 加载模型
@@ -314,18 +316,33 @@ def main():
                 return out
 
             def best_from_plateaus(angle_results):
-                """从角度扫描结果中找最佳平台期，返回 (consensus, angles, length, acc)"""
+                """
+                从角度扫描结果中找最佳平台期。
+                --no_gt_selection: 选最长平台期（无GT，实际部署用）
+                默认: 用GT选准确率最高的平台期（有GT，评估用）
+                """
                 plateaus = find_plateaus(angle_results,
                                          threshold=args.hamming_threshold,
                                          weighted=True)
-                best_acc = -1.0
                 best_plat = None
-                for consensus, plat_angles, length in plateaus:
-                    acc = float(np.mean(
-                        np.array([int(c) for c in consensus]) == gt_bits) * 100.0)
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_plat = (consensus, plat_angles, length, acc)
+                if args.no_gt_selection:
+                    # 无GT：选最长平台期（最稳定）
+                    best_length = -1
+                    for consensus, plat_angles, length in plateaus:
+                        if length > best_length:
+                            best_length = length
+                            acc = float(np.mean(
+                                np.array([int(c) for c in consensus]) == gt_bits) * 100.0)
+                            best_plat = (consensus, plat_angles, length, acc)
+                else:
+                    # 有GT：选准确率最高的
+                    best_acc = -1.0
+                    for consensus, plat_angles, length in plateaus:
+                        acc = float(np.mean(
+                            np.array([int(c) for c in consensus]) == gt_bits) * 100.0)
+                        if acc > best_acc:
+                            best_acc = acc
+                            best_plat = (consensus, plat_angles, length, acc)
                 return best_plat
 
             for fname, img in images:
