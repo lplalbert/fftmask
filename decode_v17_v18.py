@@ -2,6 +2,7 @@
 v17/v18 水印解码脚本。
 
 从原图裁剪不同尺寸，resize 到 crop_size 解码，搜索最佳裁剪尺寸。
+支持角度搜索（0.2° 步长 + 平台期检测）。
 
 用法:
     # 搜索最佳裁剪尺寸
@@ -11,6 +12,14 @@ v17/v18 水印解码脚本。
         --bits_key b_00 \
         --model_path /path/to/best_model.pth \
         --channel b --sweep_crop
+
+    # 搜索最佳角度（用已知最佳裁剪尺寸）
+    python decode_v17_v18.py \
+        --image_dir /path/to/images \
+        --bits_file /path/to/bits.json \
+        --bits_key b_00 \
+        --model_path /path/to/best_model.pth \
+        --channel b --sweep_angle --best_crop 1498
 
     # 批量搜索
     python decode_v17_v18.py \
@@ -47,6 +56,74 @@ def extract_channel(image_bgr, channel):
         raise ValueError(f"Unknown channel: {channel}")
 
 
+def rotate_image(image, angle, border_value=0):
+    """旋转图片，保持所有内容可见（黑边填充）。"""
+    if abs(angle) < 0.01:
+        return image
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+    return cv2.warpAffine(image, M, (new_w, new_h),
+                          borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=border_value)
+
+
+def hamming_distance(a, b):
+    """计算两个比特序列的汉明距离。"""
+    return sum(x != y for x, y in zip(a, b))
+
+
+def get_consensus(seqs, weighted=True):
+    """
+    取每个 bit 位的众数作为共识序列。
+    weighted=True 时，平台期中间位置权重高，边缘权重低（三角形加权）。
+    """
+    n = len(seqs[0])
+    m = len(seqs)
+    if weighted and m > 1:
+        center = (m - 1) / 2.0
+        weights = [1.0 + (1.0 - abs(i - center) / center) for i in range(m)]
+    else:
+        weights = [1.0] * m
+    bits = []
+    for bit_pos in range(n):
+        score_0 = sum(weights[i] for i in range(m) if seqs[i][bit_pos] == '0')
+        score_1 = sum(weights[i] for i in range(m) if seqs[i][bit_pos] == '1')
+        bits.append('1' if score_1 >= score_0 else '0')
+    return "".join(bits)
+
+
+def find_plateaus(results, threshold=5, weighted=True):
+    """
+    根据解码序列的相似性划分平台期（模糊聚类）。
+    相邻角度汉明距离 ≤ threshold → 同一平台期。
+    results: [(angle, vote_str), ...]
+    返回: [(consensus_seq, angles_list, length), ...]
+    """
+    plateaus = []
+    cur_seqs = [results[0][1]]
+    cur_angles = [results[0][0]]
+    for angle, seq in results[1:]:
+        consensus = get_consensus(cur_seqs, weighted=weighted)
+        if hamming_distance(seq, consensus) <= threshold:
+            cur_angles.append(angle)
+            cur_seqs.append(seq)
+        else:
+            plateaus.append((get_consensus(cur_seqs, weighted=weighted),
+                             list(cur_angles), len(cur_angles)))
+            cur_seqs = [seq]
+            cur_angles = [angle]
+    plateaus.append((get_consensus(cur_seqs, weighted=weighted),
+                     list(cur_angles), len(cur_angles)))
+    return plateaus
+
+
 def five_point_crops(h, w, crop_size):
     """返回5点裁剪的 (y, x) 左上角坐标：中心 + 四角。"""
     cy, cx = h // 2, w // 2
@@ -60,12 +137,18 @@ def five_point_crops(h, w, crop_size):
     ]
 
 
-def decode_single_image(model, image_bgr, channel, device, crop_size=512, crop_from_orig=None):
+def decode_single_image(model, image_bgr, channel, device, crop_size=512,
+                        crop_from_orig=None, angle=0.0):
     """
     对单张图片解码。
     crop_from_orig: 从原图裁剪的尺寸（然后 resize 到 crop_size）。
                     None 表示不裁剪，直接 resize 整张图到 crop_size。
+    angle: 旋转角度（度），先旋转再裁剪。
     """
+    # 先旋转
+    if abs(angle) > 0.01:
+        image_bgr = rotate_image(image_bgr, angle)
+
     h, w = image_bgr.shape[:2]
 
     if crop_from_orig is not None and crop_from_orig < min(h, w):
@@ -127,10 +210,18 @@ def main():
     parser.add_argument("--angle_bins", type=int, default=180)
     parser.add_argument("--crop_size", type=int, default=512, help="送入模型的尺寸")
     parser.add_argument("--sweep_crop", action="store_true", help="搜索最佳裁剪尺寸")
+    parser.add_argument("--sweep_angle", action="store_true", help="搜索最佳旋转角度")
+    parser.add_argument("--best_crop", type=int, default=None, help="已知最佳裁剪尺寸（角度搜索时用）")
     parser.add_argument("--batch", action="store_true", help="遍历子目录")
     parser.add_argument("--min_ratio", type=float, default=0.38, help="搜索起始比例")
     parser.add_argument("--max_ratio", type=float, default=1.0, help="搜索结束比例")
     parser.add_argument("--step_ratio", type=float, default=0.01, help="搜索步长")
+    parser.add_argument("--angle_min", type=float, default=0.0, help="角度搜索起始")
+    parser.add_argument("--angle_max", type=float, default=360.0, help="角度搜索结束")
+    parser.add_argument("--angle_step", type=float, default=0.2, help="细搜步长")
+    parser.add_argument("--coarse_step", type=float, default=5.0, help="粗搜步长")
+    parser.add_argument("--hamming_threshold", type=int, default=5,
+                        help="平台期汉明距离阈值")
     args = parser.parse_args()
 
     # 加载模型
@@ -199,6 +290,86 @@ def main():
                 avg = np.mean(accs) if accs else 0.0
                 results.append((cs, avg, len(accs)))
                 print(f"    crop={cs:4d} ({cs/short_side:.2f}S)  avg_vote_acc={avg:.2f}%")
+
+        elif args.sweep_angle:
+            # 两阶段角度搜索：粗搜(coarse_step) → 细搜(angle_step)
+            best_crop = args.best_crop or short_side
+            coarse_angles = np.arange(args.angle_min,
+                                      args.angle_max + args.coarse_step / 2,
+                                      args.coarse_step)
+
+            print(f"  原图: {h0}×{w0}, best_crop={best_crop}")
+            print(f"  两阶段搜索: 粗搜 {args.coarse_step:.1f}°步长, "
+                  f"细搜 {args.angle_step:.1f}°步长\n")
+
+            def decode_angle_sweep(img, angles):
+                """对单张图做角度扫描，返回 [(angle, vote_str), ...]"""
+                out = []
+                for angle in angles:
+                    vb, vt, _ = decode_single_image(
+                        model, img, args.channel, device,
+                        args.crop_size, crop_from_orig=best_crop, angle=angle)
+                    if vt is not None:
+                        out.append((angle, vt))
+                return out
+
+            def best_from_plateaus(angle_results):
+                """从角度扫描结果中找最佳平台期，返回 (consensus, angles, length, acc)"""
+                plateaus = find_plateaus(angle_results,
+                                         threshold=args.hamming_threshold,
+                                         weighted=True)
+                best_acc = -1.0
+                best_plat = None
+                for consensus, plat_angles, length in plateaus:
+                    acc = float(np.mean(
+                        np.array([int(c) for c in consensus]) == gt_bits) * 100.0)
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_plat = (consensus, plat_angles, length, acc)
+                return best_plat
+
+            for fname, img in images:
+                # 第一阶段：粗搜
+                coarse_results = decode_angle_sweep(img, coarse_angles)
+                if not coarse_results:
+                    continue
+                coarse_plat = best_from_plateaus(coarse_results)
+                if coarse_plat is None:
+                    continue
+
+                _, coarse_pa, _, coarse_acc = coarse_plat
+                coarse_center = coarse_pa[len(coarse_pa) // 2]
+
+                # 第二阶段：在粗搜最佳角度 ± (coarse_step) 范围内细搜
+                fine_min = coarse_center - args.coarse_step
+                fine_max = coarse_center + args.coarse_step
+                fine_angles = np.arange(fine_min,
+                                        fine_max + args.angle_step / 2,
+                                        args.angle_step)
+                fine_results = decode_angle_sweep(img, fine_angles)
+                if not fine_results:
+                    # 退回到粗搜结果
+                    results.append((best_crop, coarse_acc, fname, coarse_plat))
+                    continue
+
+                fine_plat = best_from_plateaus(fine_results)
+                if fine_plat is None:
+                    results.append((best_crop, coarse_acc, fname, coarse_plat))
+                    continue
+
+                # 取细搜和粗搜中更好的
+                _, fine_pa, fine_len, fine_acc = fine_plat
+                if fine_acc >= coarse_acc:
+                    best_plat = fine_plat
+                else:
+                    best_plat = coarse_plat
+
+                results.append((best_crop, best_plat[3], fname, best_plat))
+                c, pa, l, a = best_plat
+                print(f"    {fname}: best_angle={pa[len(pa)//2]:+.1f}° "
+                      f"(平台期 {pa[0]:+.1f}°~{pa[-1]:+.1f}°, 长度{l}), "
+                      f"acc={a:.2f}%")
+
         else:
             # 单尺寸
             for fname, img in images:
@@ -217,6 +388,7 @@ def main():
         subdirs = sorted(d for d in os.listdir(args.image_dir)
                          if os.path.isdir(os.path.join(args.image_dir, d)))
         all_by_cs = defaultdict(list)
+        all_angle_accs = []
         for subdir in subdirs:
             key = f"{args.channel}_{subdir}"
             gt_bits = load_gt_bits(args.bits_file, key)
@@ -224,8 +396,14 @@ def main():
             img_dir = os.path.join(args.image_dir, subdir)
             print(f"\n  {subdir} | GT: {gt_text}")
             results = decode_dir(img_dir, gt_bits, gt_text)
-            for cs, acc, _ in results:
-                all_by_cs[cs].append(acc)
+            if args.sweep_angle:
+                # 角度搜索结果: (best_crop, best_acc, fname, best_plat)
+                for _, acc, _, _ in results:
+                    all_angle_accs.append(acc)
+            else:
+                # 裁剪搜索结果: (cs, acc, count_or_fname)
+                for cs, acc, _ in results:
+                    all_by_cs[cs].append(acc)
 
         if args.sweep_crop and all_by_cs:
             print(f"\n{'='*60}")
@@ -238,6 +416,14 @@ def main():
                 mark = " <-- BEST" if cs == best_cs else ""
                 print(f"    crop={cs:4d}  avg_vote_acc={acc:.2f}%{mark}")
             print(f"\n  BEST: crop_size={best_cs}  avg_vote_acc={best_acc:.2f}%")
+
+        elif args.sweep_angle and all_angle_accs:
+            print(f"\n{'='*60}")
+            print(f"  角度搜索汇总（跨 {len(subdirs)} 个子目录, "
+                  f"共 {len(all_angle_accs)} 张图）")
+            print(f"{'='*60}")
+            avg_acc = np.mean(all_angle_accs)
+            print(f"    avg_best_acc={avg_acc:.2f}%")
     else:
         gt_bits = load_gt_bits(args.bits_file, args.bits_key)
         gt_text = "".join(str(int(b)) for b in gt_bits)
