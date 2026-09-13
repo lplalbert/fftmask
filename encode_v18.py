@@ -49,8 +49,10 @@ class WatermarkV18(WatermarkV17):
 
         流程:
         1. 复制二值模板 (背景=0, 环=255)
-        2. 对白色区域(环)：随机挖掉 hollow_ratio 比例的像素变为0
-        3. 黑色区域(背景)保持0不变
+        2. 对黑色区域(背景=0)：随机保留 (1-hollow_ratio) 比例的像素变为255
+        3. 白色区域(环=255)保持255不变
+
+        镂空逻辑: 0处镂空(透明), 255处实心(显示)
 
         Args:
             Tm_binary: 二值模板 (0/255), uint8
@@ -59,12 +61,13 @@ class WatermarkV18(WatermarkV17):
             Tm_hollow: 镂空模板, uint8, 值只有 0 和 255
         """
         Tm_hollow = Tm_binary.copy()
-        white_mask = Tm_binary > 127
+        black_mask = Tm_binary < 128
 
         if self.hollow_ratio > 0:
-            # 对白色像素，随机挖掉 hollow_ratio 比例
-            hollow_mask = np.random.rand(*Tm_binary.shape) < self.hollow_ratio
-            Tm_hollow[white_mask & hollow_mask] = 0
+            # 对黑色像素(背景)，随机保留 (1-hollow_ratio) 比例变为255
+            # 即 hollow_ratio 比例保持0(镂空)，其余变为255(实心)
+            fill_mask = np.random.rand(*Tm_binary.shape) < (1 - self.hollow_ratio)
+            Tm_hollow[black_mask & fill_mask] = 255
 
         return Tm_hollow
 
