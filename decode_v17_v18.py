@@ -200,7 +200,7 @@ def load_gt_bits(bits_file, bits_key):
 def main():
     parser = argparse.ArgumentParser(description="v17/v18 水印解码")
     parser.add_argument("--image_dir", required=True)
-    parser.add_argument("--bits_file", required=True)
+    parser.add_argument("--bits_file", default=None)
     parser.add_argument("--bits_key", default=None)
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--channel", required=True, choices=["b", "cb", "y", "cr"])
@@ -224,6 +224,8 @@ def main():
                         help="平台期汉明距离阈值")
     parser.add_argument("--no_gt_selection", action="store_true",
                         help="不用GT选平台期，选最长平台期（实际部署用）")
+    parser.add_argument("--no_gt", action="store_true",
+                        help="无GT模式，只输出解码结果，不计算准确率")
     args = parser.parse_args()
 
     # 加载模型
@@ -389,15 +391,20 @@ def main():
 
         else:
             # 单尺寸
+            crop_from = args.best_crop if args.best_crop else short_side
             for fname, img in images:
                 vb, vt, _ = decode_single_image(model, img, args.channel, device,
-                                                 args.crop_size, crop_from_orig=short_side)
+                                                 args.crop_size, crop_from_orig=crop_from)
                 if vb is None:
                     continue
-                acc = float(np.mean(vb == gt_bits) * 100.0)
-                results.append((short_side, acc, fname))
-                diff = "".join("^" if v != g else " " for v, g in zip(vt, gt_text))
-                print(f"    {fname}: {acc:.2f}%  diff: {diff}")
+                if gt_bits is not None:
+                    acc = float(np.mean(vb == gt_bits) * 100.0)
+                    results.append((crop_from, acc, fname))
+                    diff = "".join("^" if v != g else " " for v, g in zip(vt, gt_text))
+                    print(f"    {fname}: {acc:.2f}%  diff: {diff}")
+                else:
+                    results.append((crop_from, vt, fname))
+                    print(f"    {fname}: {vt}")
 
         return results
 
@@ -406,23 +413,41 @@ def main():
                          if os.path.isdir(os.path.join(args.image_dir, d)))
         all_by_cs = defaultdict(list)
         all_angle_accs = []
+        all_decoded = []
+        all_single_accs = []  # 单裁剪模式汇总
         for subdir in subdirs:
-            key = f"{args.channel}_{subdir}"
-            gt_bits = load_gt_bits(args.bits_file, key)
-            gt_text = "".join(str(int(b)) for b in gt_bits)
-            img_dir = os.path.join(args.image_dir, subdir)
-            print(f"\n  {subdir} | GT: {gt_text}")
+            if args.no_gt:
+                gt_bits = None
+                gt_text = None
+                img_dir = os.path.join(args.image_dir, subdir)
+                print(f"\n  {subdir}")
+            else:
+                key = f"{args.channel}_{subdir}"
+                gt_bits = load_gt_bits(args.bits_file, key)
+                gt_text = "".join(str(int(b)) for b in gt_bits)
+                img_dir = os.path.join(args.image_dir, subdir)
+                print(f"\n  {subdir} | GT: {gt_text}")
             results = decode_dir(img_dir, gt_bits, gt_text)
-            if args.sweep_angle:
+            if args.no_gt:
+                for _, vt, fname in results:
+                    all_decoded.append((subdir, fname, vt))
+            elif args.sweep_angle:
                 # 角度搜索结果: (best_crop, best_acc, fname, best_plat)
                 for _, acc, _, _ in results:
                     all_angle_accs.append(acc)
             else:
-                # 裁剪搜索结果: (cs, acc, count_or_fname)
+                # 裁剪搜索结果: (cs, acc, count_or_fname) 或 单裁剪 (cs, acc, fname)
                 for cs, acc, _ in results:
                     all_by_cs[cs].append(acc)
+                    all_single_accs.append(acc)
 
-        if args.sweep_crop and all_by_cs:
+        if args.no_gt and all_decoded:
+            print(f"\n{'='*60}")
+            print(f"  解码结果（跨 {len(subdirs)} 个子目录, 共 {len(all_decoded)} 张图）")
+            print(f"{'='*60}")
+            for subdir, fname, bits in all_decoded:
+                print(f"    {subdir}/{fname}: {bits}")
+        elif args.sweep_crop and all_by_cs:
             print(f"\n{'='*60}")
             print(f"  汇总（跨 {len(subdirs)} 个子目录）")
             print(f"{'='*60}")
@@ -441,10 +466,23 @@ def main():
             print(f"{'='*60}")
             avg_acc = np.mean(all_angle_accs)
             print(f"    avg_best_acc={avg_acc:.2f}%")
+        if all_single_accs and not args.sweep_crop and not args.sweep_angle:
+            print(f"\n{'='*60}")
+            print(f"  汇总（跨 {len(subdirs)} 个子目录, "
+                  f"共 {len(all_single_accs)} 张图）")
+            print(f"{'='*60}")
+            avg_acc = np.mean(all_single_accs)
+            max_acc = np.max(all_single_accs)
+            print(f"    avg_vote_acc={avg_acc:.2f}%  max_vote_acc={max_acc:.2f}%")
     else:
-        gt_bits = load_gt_bits(args.bits_file, args.bits_key)
-        gt_text = "".join(str(int(b)) for b in gt_bits)
-        print(f"GT bits: {gt_text}\n")
+        if args.no_gt:
+            gt_bits = None
+            gt_text = None
+            print(f"无GT模式\n")
+        else:
+            gt_bits = load_gt_bits(args.bits_file, args.bits_key)
+            gt_text = "".join(str(int(b)) for b in gt_bits)
+            print(f"GT bits: {gt_text}\n")
         decode_dir(args.image_dir, gt_bits, gt_text)
 
 

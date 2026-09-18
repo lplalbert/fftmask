@@ -75,14 +75,14 @@ class MixedNoiseDataset(Dataset):
 
 def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                   ring_positions=None, bits_per_ring=None):
-    """构建训练数据集 (v18 镂空版)"""
+    """构建训练数据集 (v18 B通道镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
         bits_per_ring = cfg.get('bits_per_ring', [20, 40])
 
-    dataset = WatermarkDatasetV11(
-        image_dir=cfg['train_dir'],
+    datasets_cfg = cfg.get('datasets', None)
+    kwargs = dict(
         transform=transform,
         block_size=cfg.get('block_size', 512),
         num_bits=sum(bits_per_ring),
@@ -92,38 +92,54 @@ def build_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('train_length', 0),
         M_w=cfg.get('M_w', 200),
         M_b=cfg.get('M_b', 55),
-        hollow_ratio=cfg.get('hollow_ratio', 0.3)
+        hollow_ratio=cfg.get('hollow_ratio', 0.3),
+        wechat_downsample_factor=cfg.get('wechat_downsample_factor', 2),
     )
+    if datasets_cfg is not None:
+        dataset = WatermarkDatasetV11(datasets=datasets_cfg, **kwargs)
+    else:
+        dataset = WatermarkDatasetV11(
+            image_dir=cfg['train_dir'],
+            max_images=cfg.get('train_length', 0),
+            **kwargs
+        )
     return dataset
 
 
 def build_val_dataset(cfg, transform, noise_level='none', alpha_embed=0.016,
                       ring_positions=None, bits_per_ring=None):
-    """构建验证数据集 (v18 镂空版)"""
+    """构建验证数据集 (v18 B通道镂空版)"""
     if ring_positions is None:
         ring_positions = cfg.get('ring_positions', [8, 15])
     if bits_per_ring is None:
         bits_per_ring = cfg.get('bits_per_ring', [20, 40])
 
-    dataset = WatermarkDatasetV11(
-        image_dir=cfg['val_dir'],
+    val_datasets_cfg = cfg.get('val_datasets', None)
+    kwargs = dict(
         transform=transform,
         block_size=cfg.get('block_size', 512),
         num_bits=sum(bits_per_ring),
         alpha_embed=alpha_embed,
         noise_level=noise_level,
-        max_rotation=0,  # 验证时不旋转
+        max_rotation=0,
         max_shift=cfg.get('max_shift', 0.5),
         r_watermark=ring_positions,
         bitsf=bits_per_ring,
-        max_images=cfg.get('val_length', 0),
         M_w=cfg.get('M_w', 200),
         M_b=cfg.get('M_b', 55),
-        hollow_ratio=cfg.get('hollow_ratio', 0.3)
+        hollow_ratio=cfg.get('hollow_ratio', 0.3),
+        wechat_downsample_factor=cfg.get('wechat_downsample_factor', 2),
     )
+    if val_datasets_cfg is not None:
+        dataset = WatermarkDatasetV11(datasets=val_datasets_cfg, **kwargs)
+    else:
+        dataset = WatermarkDatasetV11(
+            image_dir=cfg['val_dir'],
+            max_images=cfg.get('val_length', 0),
+            **kwargs
+        )
     return dataset
 
 
@@ -182,7 +198,8 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device or cfg.get('device', '0')
+    if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.device or cfg.get('device', '0')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 创建输出目录
@@ -286,6 +303,10 @@ def main():
         logger.info("权重加载完成")
     else:
         logger.warning("未找到预训练权重，从头训练")
+
+    # 预初始化屏摄噪声单例（CPU），fork worker 会继承此全局变量，避免 CUDA 重初始化
+    from noise_utils import _get_physical_moire_layer
+    _get_physical_moire_layer()
 
     model = model.to(device)
 
@@ -451,4 +472,6 @@ def main():
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method('spawn')
     main()

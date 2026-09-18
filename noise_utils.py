@@ -320,35 +320,87 @@ def add_pimog_noise(image, noise_level=0.1):
     """
     添加PIMOG (Perceptually Important Map Guided) 噪声
     与pimog.py中的ScreenShooting实现保持一致
-    
+
     Args:
         image: 输入图像 (H, W, C) 或 (H, W)
         noise_level: 噪声强度，范围 0-1
-        
+
     Returns:
         加噪后的图像
     """
     # 转换为tensor
     if len(image.shape) == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    
+
     # 转换为tensor并归一化到[-1, 1]
     image_tensor = transforms.ToTensor()(image)
     image_tensor = transforms.Normalize(mean=[0.5], std=[0.5])(image_tensor)
     image_tensor = image_tensor.unsqueeze(0)  # 添加batch维度
-    
+
     # 应用PIMOG噪声
     device = image_tensor.device
     shooter = ScreenShooting()
     noised_tensor = shooter.forward(image_tensor)
-    
+
     # 反归一化并转换回numpy
     noised_tensor = noised_tensor.squeeze(0)
     noised_image = (noised_tensor * 0.5 + 0.5) * 255
     noised_image = torch.clip(noised_image, 0, 255)
     noised_image = noised_image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-    
+
     return noised_image
+
+
+# 单例缓存：避免每次调用都重新创建 EfficientScreenMoireNoise 对象
+_physical_moire_layer = None
+_physical_moire_device = None
+
+def _get_physical_moire_layer():
+    """懒初始化 physical_moire 层（单例），有 CUDA 时自动用 GPU"""
+    global _physical_moire_layer, _physical_moire_device
+    if _physical_moire_layer is None:
+        from physical_moire import EfficientScreenMoireNoise
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _physical_moire_layer = EfficientScreenMoireNoise(
+            spatial_coverage="global",
+            default_is_extreme=True,    # extreme 配置
+            validate_input=False,       # 训练时跳过输入校验，避免 GPU 同步
+        ).to(device).eval()
+        _physical_moire_device = device
+    return _physical_moire_layer, _physical_moire_device
+
+def add_physical_moire_noise(image):
+    """
+    基于 physical_moire.py 的完整屏摄模拟（screen-capture 预设）：
+    - 基于显示/相机元数据的物理级莫尔条纹模拟
+    - 覆盖 fine/medium/coarse 多尺度条带
+    - 包含 display subpixel layout 和 sensor CFA 随机化
+    - 全图覆盖（spatial_coverage='global'）
+    - 含曝光损失、镜头模糊、白平衡、传感器噪声等完整屏摄管线
+    - 有 CUDA 时自动使用 GPU（~20ms/图），CPU 较慢（~10s/图）
+
+    Args:
+        image: numpy (H, W, C) uint8 BGR
+    Returns:
+        加噪后的 numpy (H, W, C) uint8 BGR
+    """
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    layer, device = _get_physical_moire_layer()
+
+    # numpy HWC uint8 → CHW float [0,1]
+    image_tensor = torch.from_numpy(
+        image.astype(np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0).to(device)  # [1, 3, H, W]
+
+    with torch.no_grad():
+        noised_tensor = layer(image_tensor)
+
+    # CHW float [0,1] → HWC uint8
+    noised = noised_tensor.squeeze(0).clamp(0.0, 1.0)
+    noised = (noised.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+    return noised
 
 
 def add_jpeg_compression_noise(image, quality=50):
@@ -647,12 +699,12 @@ def _whole_plane_dct_hf_zero(plane, keep_ratio):
     return np.clip(recon + 128.0, 0.0, 255.0)
 
 
-def add_wechat_noise(image, quality=60, zigzag_keep=21, **kwargs):
+def add_wechat_noise(image, quality=60, zigzag_keep=21, downsample_factor=4, **kwargs):
     """
     模拟微信JPEG压缩噪声
 
     流程：
-    1. 下采样 512→256 再上采样 256→512 (模拟微信传输的分辨率损失)
+    1. 下采样 512→(512/factor) 再上采样 (512/factor)→512 (模拟微信传输的分辨率损失)
     2. RGB → YCbCr (BT.601) → 4:2:0 色度下采样
     3. 整图 DCT → 高频清零 → IDCT (保留 zigzag_keep/64 比例的低频)
     4. 色度上采样 → YCbCr → RGB
@@ -661,6 +713,7 @@ def add_wechat_noise(image, quality=60, zigzag_keep=21, **kwargs):
         image: 输入图像 (H, W, C) uint8
         quality: JPEG 编码质量 (未使用, 保留接口兼容)
         zigzag_keep: DCT 之字形保留系数个数 (1-64), 默认 21
+        downsample_factor: 下采样倍数 (2=512→256, 4=512→128), 默认 4
 
     Returns:
         压缩后的图像 (H, W, C) uint8
@@ -671,7 +724,7 @@ def add_wechat_noise(image, quality=60, zigzag_keep=21, **kwargs):
     h, w = image.shape[:2]
 
     # 1. 下采样→上采样 (模拟微信分辨率损失)
-    small = cv2.resize(image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(image, (w // downsample_factor, h // downsample_factor), interpolation=cv2.INTER_AREA)
     image = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
     # 2-4. DCT 高频清零

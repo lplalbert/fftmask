@@ -1,12 +1,6 @@
 """
-v18 水印数据集 — 镂空模板，B通道版本
-在 v17 基础上使用镂空模板嵌入，水印嵌入B通道而非Cb通道
-
-镂空原理:
-- 生成二值模板 (0/255)
-- 对白色区域(环)随机挖掉 hollow_ratio 比例的像素变为0
-- 黑色区域(背景)保持0不变
-- 镂空模板值只有两种: 0 和 255
+v17 水印数据集
+无旋转矫正环，仅包含水印环
 """
 import os
 import cv2
@@ -14,23 +8,22 @@ import numpy as np
 import torch
 import random
 from torch.utils.data import Dataset
-from encode_v18 import WatermarkV18
+from encode_v17 import WatermarkV17
 from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_wechat_noise, add_tile_rotate_crop_noise, add_physical_moire_noise
 
 
-class WatermarkDatasetV18(Dataset):
+class WatermarkDatasetV17(Dataset):
     """
-    v18 水印数据集 — 镂空模板
+    v17 水印数据集
+    无旋转矫正环
     """
     def __init__(self, image_dir=None, block_size=512, num_bits=60,
-                 r_watermark=[12, 25], bitsf=[15, 45],
+                 r_watermark=[8, 15], bitsf=[20, 40],
                  alpha_embed=0.016, transform=None,
                  noise_level='none', noise_pool=None,
                  max_angle=360, crop_scale_range=None,
                  max_rotation=5.0, max_shift=0.5,
-                 max_images=0,
-                 M_w=255, M_b=0, hollow_ratio=0.3,
-                 wechat_downsample_factor=4,
+                 max_images=0, wechat_downsample_factor=4,
                  datasets=None):
         """
         Args:
@@ -48,11 +41,10 @@ class WatermarkDatasetV18(Dataset):
             max_rotation: 最大旋转角度 (度，用于tile_crop噪声)
             max_shift: 最大循环平移比例 (0-1)，用于tile_crop噪声
             max_images: 最大图像数
-            M_w: 水印高值区域亮度
-            M_b: 水印低值区域亮度
-            hollow_ratio: 镂空比例 (0-1)
             datasets: 多目录配置列表，每项为 dict:
                 {'dir': path, 'mode': 'resize'|'crop', 'max_images': N}
+                mode='resize': 直接resize到block_size (适合小图如COCO/Document)
+                mode='crop': 随机裁剪block_size×block_size块 (适合大图如PPT截图)
         """
         self.block_size = block_size
         self.transform = transform
@@ -64,21 +56,17 @@ class WatermarkDatasetV18(Dataset):
         self.crop_scale_range = crop_scale_range
         self.max_rotation = max_rotation
         self.max_shift = max_shift
-        self.force_noise_pair = None
+        self.force_noise_pair = None  # 设为 (type1, type2) 可强制指定噪声组合
         self.wechat_downsample_factor = wechat_downsample_factor
-        self.hollow_ratio = hollow_ratio
 
-        # 水印生成器 (v18 镂空版)
-        self.watermark_system = WatermarkV18(
+        # 水印生成器
+        self.watermark_system = WatermarkV17(
             L1=block_size,
             k1=30000,
             r_watermark=r_watermark,
             bitsf=bitsf,
             r_range=1,
-            n_sectors=num_bits,
-            M_w=M_w,
-            M_b=M_b,
-            hollow_ratio=hollow_ratio
+            n_sectors=num_bits
         )
 
         # 加载图像列表 (支持多目录)
@@ -94,6 +82,7 @@ class WatermarkDatasetV18(Dataset):
                 if ds_max > 0:
                     files = files[:ds_max]
                 if mode == 'tile':
+                    # tile模式：预扫描图像尺寸，计算每张图的裁剪数
                     tiles_per_img = ds.get('tiles_per_img', 0)
                     tile_count = 0
                     for f in files:
@@ -117,6 +106,7 @@ class WatermarkDatasetV18(Dataset):
                         self.image_items.append((d, f, mode, 0))
                     print(f"  [dataset] {d}: {len(files)} images, mode={mode}")
         else:
+            # 兼容旧的单目录模式
             self.image_dir = image_dir
             self.image_files = [f for f in os.listdir(image_dir)
                                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
@@ -162,7 +152,16 @@ class WatermarkDatasetV18(Dataset):
         return len(self.image_items)
 
     def rotate_image(self, image, angle):
-        """旋转图像 (保持尺寸)"""
+        """
+        旋转图像 (保持尺寸)
+
+        Args:
+            image: 输入图像
+            angle: 旋转角度 (度)
+
+        Returns:
+            rotated: 旋转后的图像
+        """
         h, w = image.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -176,12 +175,14 @@ class WatermarkDatasetV18(Dataset):
         bs = self.block_size
 
         if mode == 'tile':
+            # 平铺裁剪：将图像网格化，取第tile_idx个块
             ny = h // bs
             nx = w // bs
             row = tile_idx // nx
             col = tile_idx % nx
             image = image[row*bs:(row+1)*bs, col*bs:(col+1)*bs]
         elif mode == 'crop' and (h > bs or w > bs):
+            # 随机裁剪
             if h < bs or w < bs:
                 scale = max(bs / h, bs / w)
                 image = cv2.resize(image, (int(w * scale), int(h * scale)))
@@ -190,21 +191,24 @@ class WatermarkDatasetV18(Dataset):
             x = random.randint(0, w - bs) if w > bs else 0
             image = image[y:y+bs, x:x+bs]
         else:
+            # resize模式
             if image.shape[:2] != (bs, bs):
                 image = cv2.resize(image, (bs, bs))
         return image
 
     def __getitem__(self, idx):
+        # 读取图像
         img_dir, img_file, mode, tile_idx = self.image_items[idx]
         img_path = os.path.join(img_dir, img_file)
         image = cv2.imread(img_path)
+
         image = self._prepare_image(image, mode, tile_idx)
 
         # 随机生成水印bits
         watermark_bits = np.random.randint(0, 2, size=self.num_bits)
 
-        # 生成镂空水印模板
-        Tm, M1, _ = self.watermark_system.generate_template(numbit=watermark_bits, hollow=True)
+        # 生成水印模板
+        Tm, M1, _ = self.watermark_system.generate_template(numbit=watermark_bits)
 
         # 确保图像格式正确
         image = np.clip(image, 0, 255).astype(np.uint8)
@@ -213,23 +217,33 @@ class WatermarkDatasetV18(Dataset):
         else:
             host_bgr = image.copy()
 
-        # B通道嵌入
-        b_ch = host_bgr[:, :, 0].astype(np.float32)
+        # 确保Tm格式正确
+        if len(Tm.shape) == 2:
+            Tm_bgr = cv2.cvtColor(Tm, cv2.COLOR_GRAY2BGR)
+        else:
+            Tm_bgr = Tm.copy()
 
-        # Tm 已经是单通道 (0/255 值)
-        Tm_gray = Tm.astype(np.float32)
+        # Cb通道嵌入
+        ycrcb = cv2.cvtColor(host_bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+        y_ch, cr_ch, cb_ch = cv2.split(ycrcb)
 
-        # 在B通道嵌入水印
-        b_wm = b_ch * (1 - self.alpha_embed) + Tm_gray * self.alpha_embed
+        # 将Tm转为单通道用于Cb嵌入
+        if len(Tm_bgr.shape) == 3:
+            Tm_gray = cv2.cvtColor(Tm_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        else:
+            Tm_gray = Tm_bgr.astype(np.float32)
+
+        # 在Cb通道嵌入水印
+        cb_wm = cb_ch * (1 - self.alpha_embed) + Tm_gray * self.alpha_embed
 
         # 数值稳定性检查
-        if np.isnan(b_wm).any() or np.isinf(b_wm).any():
-            print(f"NaN or Inf found in b_wm! alpha_embed={self.alpha_embed}")
-            b_wm = b_ch.copy()
+        if np.isnan(cb_wm).any() or np.isinf(cb_wm).any():
+            print(f"NaN or Inf found in cb_wm! alpha_embed={self.alpha_embed}")
+            cb_wm = cb_ch.copy()
 
-        b_wm = np.clip(b_wm, 0, 255).astype(np.uint8)
-        watermarked_image = host_bgr.copy()
-        watermarked_image[:, :, 0] = b_wm
+        cb_wm = np.clip(cb_wm, 0, 255).astype(np.uint8)
+        ycrcb_wm = cv2.merge([y_ch.astype(np.uint8), cr_ch.astype(np.uint8), cb_wm])
+        watermarked_image = cv2.cvtColor(ycrcb_wm, cv2.COLOR_YCrCb2BGR)
         watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
 
         # 添加噪声
@@ -240,12 +254,14 @@ class WatermarkDatasetV18(Dataset):
                 crop_scale_range=self.crop_scale_range
             )
         elif self.noise_level == 'shift_only':
+            # 仅循环平移，不加旋转
             watermarked_image = add_tile_rotate_crop_noise(
                 watermarked_image,
                 angle_range=(0, 0),
                 max_shift=self.max_shift
             )
         elif self.noise_level == 'pair':
+            # 两两配对噪声：从 identity/wechat/tile_crop/pimog 中随机选两种不同的依次应用
             if self.force_noise_pair is not None:
                 selected = self.force_noise_pair
             else:
@@ -256,10 +272,11 @@ class WatermarkDatasetV18(Dataset):
                 selected = [first, second]
             for noise_type in selected:
                 if noise_type == 'identity':
-                    pass
+                    pass  # 不加噪声
                 elif noise_type == 'wechat':
                     watermarked_image = add_wechat_noise(watermarked_image, downsample_factor=self.wechat_downsample_factor)
                 elif noise_type == 'tile_crop':
+                    # 3x3拼接 + 旋转 + 裁剪 (循环平移+旋转 combined)
                     watermarked_image = add_tile_rotate_crop_noise(
                         watermarked_image,
                         angle_range=(-self.max_rotation, self.max_rotation),
@@ -270,6 +287,7 @@ class WatermarkDatasetV18(Dataset):
                 elif noise_type == 'physical_moire':
                     watermarked_image = add_physical_moire_noise(watermarked_image)
         elif self.noise_level == 'fixed_triple':
+            # 固定三重噪声: tile_crop → pimog → wechat
             watermarked_image = add_tile_rotate_crop_noise(
                 watermarked_image,
                 angle_range=(-self.max_rotation, self.max_rotation),
@@ -295,10 +313,11 @@ class WatermarkDatasetV18(Dataset):
             else:
                 watermarked_image = host_bgr.copy()
 
-        # 提取B通道作为单通道输入
+        # 提取Cb通道作为单通道输入
         watermarked_image = np.clip(watermarked_image, 0, 255).astype(np.uint8)
-        b_out = watermarked_image[:, :, 0]  # B通道
-        watermarked_image = b_out[..., np.newaxis]  # (H, W, 1)
+        ycrcb_out = cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2YCrCb)
+        cb_out = ycrcb_out[:, :, 2]  # Cb通道
+        watermarked_image = cb_out[..., np.newaxis]  # (H, W, 1)
 
         if self.transform:
             watermarked_image = self.transform(watermarked_image)

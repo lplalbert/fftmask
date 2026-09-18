@@ -1,0 +1,51 @@
+# v18 B通道镂空 - 多数据集微调 (COCO + Document + PPT)
+train_dir: "/data/xsj/dataset/coco/train"
+val_dir: "/data/xsj/dataset/coco/val"
+output_dir: "output/v18_b_multi_ds"
+
+datasets:
+  - dir: "/data/xsj/dataset/coco/train"
+    mode: "resize"
+    max_images: 2000
+  - dir: "/data/xsj/dataset/document/train"
+    mode: "resize"
+    max_images: 2000
+  - dir: "/home/lpl2025/lpl/fftmask/train"
+    mode: "tile"
+    max_images: 0
+
+val_datasets:
+  - dir: "/data/xsj/dataset/coco/val"
+    mode: "resize"
+    max_images: 1024
+
+finetune:
+  weight_path: "output/v18_b_ft_noise/best_model.pth"
+  epochs: 10
+  lr: 0.00002
+
+block_size: 512
+num_bits: 60
+bits_per_ring: [15, 45]
+ring_positions: [12, 25]
+angle_bins: 180
+alpha: 0.0191
+M_w: 255
+M_b: 0
+hollow_ratio: 0.3
+
+noise_config:
+  train_noise:
+    - type: "pair"
+      weight: 1.0
+  val_noise: "none"
+
+wechat_downsample_factor: 4
+max_rotation: 0
+max_shift: 0.5
+batch_size: 32
+lambda_bit: 15.0
+train_length: 10240
+val_length: 1024
+save_every: 5
+num_workers: 0

@@ -15,24 +15,26 @@ import torch
 import random
 from torch.utils.data import Dataset
 from encode_v18 import WatermarkV18
-from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_wechat_noise, add_tile_rotate_crop_noise
+from noise_utils import add_pimog_noise, add_jpeg_compression_noise, add_wechat_noise, add_tile_rotate_crop_noise, add_physical_moire_noise
 
 
 class WatermarkDatasetV18(Dataset):
     """
     v18 水印数据集 — 镂空模板
     """
-    def __init__(self, image_dir, block_size=512, num_bits=60,
+    def __init__(self, image_dir=None, block_size=512, num_bits=60,
                  r_watermark=[12, 25], bitsf=[15, 45],
                  alpha_embed=0.016, transform=None,
                  noise_level='none', noise_pool=None,
                  max_angle=360, crop_scale_range=None,
                  max_rotation=5.0, max_shift=0.5,
                  max_images=0,
-                 M_w=255, M_b=0, hollow_ratio=0.3):
+                 M_w=255, M_b=0, hollow_ratio=0.3,
+                 wechat_downsample_factor=4,
+                 datasets=None):
         """
         Args:
-            image_dir: 图像目录
+            image_dir: 图像目录 (单目录模式，兼容旧配置)
             block_size: 图像块大小
             num_bits: 水印位数
             r_watermark: 水印环半径
@@ -49,8 +51,9 @@ class WatermarkDatasetV18(Dataset):
             M_w: 水印高值区域亮度
             M_b: 水印低值区域亮度
             hollow_ratio: 镂空比例 (0-1)
+            datasets: 多目录配置列表，每项为 dict:
+                {'dir': path, 'mode': 'resize'|'crop', 'max_images': N}
         """
-        self.image_dir = image_dir
         self.block_size = block_size
         self.transform = transform
         self.alpha_embed = alpha_embed
@@ -62,6 +65,7 @@ class WatermarkDatasetV18(Dataset):
         self.max_rotation = max_rotation
         self.max_shift = max_shift
         self.force_noise_pair = None
+        self.wechat_downsample_factor = wechat_downsample_factor
         self.hollow_ratio = hollow_ratio
 
         # 水印生成器 (v18 镂空版)
@@ -77,11 +81,48 @@ class WatermarkDatasetV18(Dataset):
             hollow_ratio=hollow_ratio
         )
 
-        # 图像文件列表
-        self.image_files = [f for f in os.listdir(image_dir)
-                           if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
-        if max_images > 0:
-            self.image_files = self.image_files[:max_images]
+        # 加载图像列表 (支持多目录)
+        bs = self.block_size
+        if datasets is not None:
+            self.image_items = []  # (dir, filename, mode, tile_idx)
+            for ds in datasets:
+                d = ds['dir']
+                mode = ds.get('mode', 'resize')
+                ds_max = ds.get('max_images', 0)
+                files = [f for f in os.listdir(d)
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+                if ds_max > 0:
+                    files = files[:ds_max]
+                if mode == 'tile':
+                    tiles_per_img = ds.get('tiles_per_img', 0)
+                    tile_count = 0
+                    for f in files:
+                        img_path = os.path.join(d, f)
+                        img = cv2.imread(img_path)
+                        if img is None:
+                            continue
+                        h, w = img.shape[:2]
+                        ny = h // bs
+                        nx = w // bs
+                        if tiles_per_img > 0:
+                            n = min(tiles_per_img, ny * nx)
+                        else:
+                            n = ny * nx
+                        for ti in range(n):
+                            self.image_items.append((d, f, 'tile', ti))
+                        tile_count += n
+                    print(f"  [dataset] {d}: {len(files)} images → {tile_count} tiles (512×512)")
+                else:
+                    for f in files:
+                        self.image_items.append((d, f, mode, 0))
+                    print(f"  [dataset] {d}: {len(files)} images, mode={mode}")
+        else:
+            self.image_dir = image_dir
+            self.image_files = [f for f in os.listdir(image_dir)
+                               if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+            if max_images > 0:
+                self.image_files = self.image_files[:max_images]
+            self.image_items = [(image_dir, f, 'resize') for f in self.image_files]
 
         # 噪声强度配置
         self.noise_config = {
@@ -118,7 +159,7 @@ class WatermarkDatasetV18(Dataset):
             raise ValueError(f"noise_level must be one of: {valid_levels}")
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.image_items)
 
     def rotate_image(self, image, angle):
         """旋转图像 (保持尺寸)"""
@@ -129,13 +170,35 @@ class WatermarkDatasetV18(Dataset):
                                  borderMode=cv2.BORDER_REFLECT)
         return rotated
 
-    def __getitem__(self, idx):
-        # 读取图像
-        img_path = os.path.join(self.image_dir, self.image_files[idx])
-        image = cv2.imread(img_path)
+    def _prepare_image(self, image, mode, tile_idx=0):
+        """根据mode处理图像到block_size×block_size"""
+        h, w = image.shape[:2]
+        bs = self.block_size
 
-        if image.shape[:2] != (self.block_size, self.block_size):
-            image = cv2.resize(image, (self.block_size, self.block_size))
+        if mode == 'tile':
+            ny = h // bs
+            nx = w // bs
+            row = tile_idx // nx
+            col = tile_idx % nx
+            image = image[row*bs:(row+1)*bs, col*bs:(col+1)*bs]
+        elif mode == 'crop' and (h > bs or w > bs):
+            if h < bs or w < bs:
+                scale = max(bs / h, bs / w)
+                image = cv2.resize(image, (int(w * scale), int(h * scale)))
+                h, w = image.shape[:2]
+            y = random.randint(0, h - bs) if h > bs else 0
+            x = random.randint(0, w - bs) if w > bs else 0
+            image = image[y:y+bs, x:x+bs]
+        else:
+            if image.shape[:2] != (bs, bs):
+                image = cv2.resize(image, (bs, bs))
+        return image
+
+    def __getitem__(self, idx):
+        img_dir, img_file, mode, tile_idx = self.image_items[idx]
+        img_path = os.path.join(img_dir, img_file)
+        image = cv2.imread(img_path)
+        image = self._prepare_image(image, mode, tile_idx)
 
         # 随机生成水印bits
         watermark_bits = np.random.randint(0, 2, size=self.num_bits)
@@ -187,7 +250,7 @@ class WatermarkDatasetV18(Dataset):
             if self.force_noise_pair is not None:
                 selected = self.force_noise_pair
             else:
-                noise_pool = ['identity', 'wechat', 'tile_crop', 'pimog']
+                noise_pool = ['identity', 'wechat', 'tile_crop', 'physical_moire']
                 first = np.random.choice(noise_pool)
                 second_pool = [n for n in noise_pool if n != first]
                 second = np.random.choice(second_pool)
@@ -196,7 +259,7 @@ class WatermarkDatasetV18(Dataset):
                 if noise_type == 'identity':
                     pass
                 elif noise_type == 'wechat':
-                    watermarked_image = add_wechat_noise(watermarked_image)
+                    watermarked_image = add_wechat_noise(watermarked_image, downsample_factor=self.wechat_downsample_factor)
                 elif noise_type == 'tile_crop':
                     watermarked_image = add_tile_rotate_crop_noise(
                         watermarked_image,
@@ -205,6 +268,8 @@ class WatermarkDatasetV18(Dataset):
                     )
                 elif noise_type == 'pimog':
                     watermarked_image = add_pimog_noise(watermarked_image)
+                elif noise_type == 'physical_moire':
+                    watermarked_image = add_physical_moire_noise(watermarked_image)
         elif self.noise_level == 'fixed_triple':
             watermarked_image = add_tile_rotate_crop_noise(
                 watermarked_image,
@@ -212,7 +277,7 @@ class WatermarkDatasetV18(Dataset):
                 max_shift=self.max_shift
             )
             watermarked_image = add_pimog_noise(watermarked_image)
-            watermarked_image = add_wechat_noise(watermarked_image)
+            watermarked_image = add_wechat_noise(watermarked_image, downsample_factor=self.wechat_downsample_factor)
         elif self.noise_level != 'none':
             config = self.noise_config[self.noise_level]
             noise_types = ['none', 'pimog', 'jpeg', 'tile_crop']
